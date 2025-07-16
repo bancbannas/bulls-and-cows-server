@@ -6,8 +6,8 @@ const app = express();
 const server = http.createServer(app);
 const io = require('socket.io')(server, {
   cors: {
-    origin: 'https://bullsandcowsgame.com', // Allow your domain
-    methods: ['GET', 'POST'], // Allow necessary methods
+    origin: 'https://bullsandcowsgame.com',
+    methods: ['GET', 'POST'],
     credentials: true
   }
 });
