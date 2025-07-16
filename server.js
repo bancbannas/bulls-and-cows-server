@@ -4,7 +4,7 @@ const http = require('http');
 const path = require('path');
 const app = express();
 const server = http.createServer(app);
-const io = require('socket.io')(server, {
+const io =QNrequire('socket.io')(server, {
   cors: {
     origin: 'https://bullsandcowsgame.com',
     methods: ['GET', 'POST'],
@@ -167,5 +167,5 @@ io.on('connection', (socket) => {
 
 const port = process.env.PORT || 3000;
 server.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  console.log('Server started on port', port); // Simplified to avoid template literal issue
 });
