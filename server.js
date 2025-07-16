@@ -1,9 +1,16 @@
+```javascript
 const express = require('express');
 const http = require('http');
 const path = require('path');
 const app = express();
 const server = http.createServer(app);
-const io = require('socket.io')(server);
+const io = require('socket.io')(server, {
+  cors: {
+    origin: 'https://bullsandcowsgame.com', // Allow your domain
+    methods: ['GET', 'POST'], // Allow necessary methods
+    credentials: true
+  }
+});
 
 app.use(express.static(path.join(__dirname)));
 
