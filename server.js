@@ -3,7 +3,13 @@ const http = require('http');
 const path = require('path');
 const app = express();
 const server = http.createServer(app);
-const io = require('socket.io')(server, { cors: { origin: '*' } });
+const io = require('socket.io')(server, {
+  cors: {
+    origin: 'https://bullsandcowsgame.com',
+    methods: ['GET', 'POST'],
+    credentials: true
+  }
+});
 
 
 app.use(express.static(path.join(__dirname)));
@@ -85,6 +91,7 @@ io.on('connection', (socket) => {
         turn: false,
         lockedIn: false
       };
+      console.log(`Player registered: ${name}, ID: ${socket.id}`);
       updateLobby();
     }
   });
@@ -98,54 +105,73 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('acceptChallenge', () => {
-    const challenged = players[socket.id];
-    const challengerId = challenged?.pendingChallenge;
-    const challenger = players[challengerId];
-    if (challenger && challenged) {
-      challenger.inGame = challenged.inGame = true;
-      challenger.opponentId = socket.id;
-      challenged.opponentId = challengerId;
-      challenger.turn = false;
-      challenged.turn = true;
-      challenger.lastTurnTime = challenged.lastTurnTime = Date.now();
-      io.to(challengerId).emit('challengeAccepted');
-      io.to(socket.id).emit('challengeAccepted');
-      updateLobby();
-    }
-  });
+socket.on('acceptChallenge', () => {
+  const challenged = players[socket.id];
+  const challengerId = challenged?.pendingChallenge;
+  const challenger = players[challengerId];
+  if (challenger && challenged) {
+    challenger.inGame = challenged.inGame = true;
+    challenger.opponentId = socket.id;
+    challenged.opponentId = challengerId;
+    challenger.turn = false;
+    challenged.turn = true;
+    challenger.lastTurnTime = challenged.lastTurnTime = Date.now();
+    console.log(`Challenge accepted: ${challenger.name} vs ${challenged.name}`);
+    console.log(`Set opponent IDs: ${challenger.name} -> ${socket.id}, ${challenged.name} -> ${challengerId}`);
+    io.to(challengerId).emit('challengeAccepted');
+    io.to(socket.id).emit('challengeAccepted');
+    updateLobby();
+  } else {
+    console.log(`Accept challenge failed: challenged=${socket.id}, challenger=${challengerId}`);
+  }
+});
 
-  socket.on('lockSecret', (code) => {
-    const p = players[socket.id];
-    if (!p) return;
-    p.secret = code;
-    p.lockedIn = true;
-    const opponent = players[p.opponentId];
-    if (opponent?.lockedIn) {
-      io.to(socket.id).emit('startGame', p.turn);
-      io.to(p.opponentId).emit('startGame', opponent.turn);
-    } else {
-      io.to(p.opponentId).emit('opponentLocked');
-    }
-  });
+socket.on('lockSecret', (code) => {
+  const p = players[socket.id];
+  if (!p) {
+    console.log(`Lock secret failed: player ${socket.id} not found`);
+    return;
+  }
+  p.secret = code;
+  p.lockedIn = true;
+  console.log(`Player ${p.name} locked secret: ${code}`);
+  const opponent = players[p.opponentId];
+  if (!opponent) {
+    console.log(`Opponent ${p.opponentId} not found for ${p.name}`);
+    return;
+  }
+  if (opponent.lockedIn) {
+    console.log(`Both players locked in: ${p.name} and ${opponent.name}`);
+    io.to(socket.id).emit('startGame', p.turn);
+    io.to(p.opponentId).emit('startGame', opponent.turn);
+  } else {
+    console.log(`Waiting for opponent ${p.opponentId} to lock in`);
+    io.to(p.opponentId).emit('opponentLocked');
+  }
+});
 
-  socket.on('submitGuess', (guess) => {
-    const p = players[socket.id];
-    const opponent = players[p?.opponentId];
-    if (!p || !opponent || !p.turn) return;
-    const feedback = emojiFeedback(guess, opponent.secret);
-    const correct = guess === opponent.secret;
-    p.guesses.push({ guess, feedback, correct });
-    p.lastTurnTime = Date.now();
-    p.turn = false;
-    opponent.turn = true;
-    opponent.lastTurnTime = Date.now();
-    io.to(socket.id).emit('guessResult', { guess, feedback });
-    io.to(p.opponentId).emit('opponentGuess', { guess, feedback });
-    if (correct) {
-      endGame(socket.id, p.opponentId, 'win');
-    }
-  });
+socket.on('submitGuess', (guess) => {
+  const p = players[socket.id];
+  const opponent = players[p?.opponentId];
+  if (!p || !opponent || !p.turn) {
+    console.log(`Submit guess failed: player=${socket.id}, opponent=${p?.opponentId}, turn=${p?.turn}`);
+    return;
+  }
+  const feedback = emojiFeedback(guess, opponent.secret);
+  const correct = guess === opponent.secret;
+  p.guesses.push({ guess, feedback, correct });
+  p.lastTurnTime = Date.now();
+  p.turn = false;
+  opponent.turn = true;
+  opponent.lastTurnTime = Date.now();
+  console.log(`Guess by ${p.name}: ${guess}, Feedback: ${feedback}`);
+  io.to(socket.id).emit('guessResult', { guess, feedback });
+  io.to(p.opponentId).emit('opponentGuess', { guess, feedback });
+  if (correct) {
+    console.log(`${p.name} won against ${opponent.name}`);
+    endGame(socket.id, p.opponentId, 'win');
+  }
+});
 
   socket.on('disconnect', () => {
     const p = players[socket.id];
