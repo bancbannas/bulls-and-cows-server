@@ -96,14 +96,17 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('challengePlayer', (targetId) => {
-    const challenger = players[socket.id];
-    const target = players[targetId];
-    if (challenger && target && !challenger.inGame && !target.inGame) {
-      target.pendingChallenge = socket.id;
-      io.to(targetId).emit('incomingChallenge', challenger.name);
-    }
-  });
+socket.on('challengePlayer', (targetId) => {
+  const challenger = players[socket.id];
+  const target = players[targetId];
+  if (challenger && target && !challenger.inGame && !target.inGame) {
+    target.pendingChallenge = socket.id;
+    console.log(`Challenge sent from ${challenger.name} to ${target.name}`);
+    io.to(targetId).emit('incomingChallenge', challenger.name);
+  } else {
+    console.log(`Challenge failed: challenger=${socket.id}, target=${targetId}`);
+  }
+});
 
 socket.on('acceptChallenge', () => {
   const challenged = players[socket.id];
@@ -173,16 +176,16 @@ socket.on('submitGuess', (guess) => {
   }
 });
 
-  socket.on('disconnect', () => {
-    const p = players[socket.id];
-    const oppId = p?.opponentId;
-    if (p?.inGame && players[oppId]) {
-      endGame(oppId, socket.id, 'win');
-    }
-    delete players[socket.id];
-    updateLobby();
-    console.log('User disconnected:', socket.id);
-  });
+socket.on('disconnect', () => {
+  const p = players[socket.id];
+  const oppId = p?.opponentId;
+  if (p?.inGame && players[oppId]) {
+    console.log(`Player ${p.name} disconnected, ending game`);
+    endGame(oppId, socket.id, 'win');
+  }
+  delete players[socket.id];
+  console.log('User disconnected:', socket.id);
+  updateLobby();
 });
 
 const port = process.env.PORT || 3000;
