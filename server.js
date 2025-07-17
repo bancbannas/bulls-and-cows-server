@@ -1,10 +1,16 @@
+```javascript
 const express = require('express');
 const http = require('http');
 const path = require('path');
 const app = express();
 const server = http.createServer(app);
-const io = require('socket.io')(server, { cors: { origin: '*' } });
-
+const io = require('socket.io')(server, {
+  cors: {
+    origin: 'https://bullsandcowsgame.com',
+    methods: ['GET', 'POST'],
+    credentials: true
+  }
+});
 
 app.use(express.static(path.join(__dirname)));
 
@@ -85,6 +91,7 @@ io.on('connection', (socket) => {
         turn: false,
         lockedIn: false
       };
+      console.log(`Player registered: ${name}, ID: ${socket.id}`);
       updateLobby();
     }
   });
@@ -94,7 +101,10 @@ io.on('connection', (socket) => {
     const target = players[targetId];
     if (challenger && target && !challenger.inGame && !target.inGame) {
       target.pendingChallenge = socket.id;
+      console.log(`Challenge sent from ${challenger.name} to ${target.name}`);
       io.to(targetId).emit('incomingChallenge', challenger.name);
+    } else {
+      console.log(`Challenge failed: challenger=${socket.id}, target=${targetId}`);
     }
   });
 
@@ -109,22 +119,31 @@ io.on('connection', (socket) => {
       challenger.turn = false;
       challenged.turn = true;
       challenger.lastTurnTime = challenged.lastTurnTime = Date.now();
+      console.log(`Challenge accepted: ${challenger.name} vs ${challenged.name}`);
       io.to(challengerId).emit('challengeAccepted');
       io.to(socket.id).emit('challengeAccepted');
       updateLobby();
+    } else {
+      console.log(`Accept challenge failed: challenged=${socket.id}, challenger=${challengerId}`);
     }
   });
 
   socket.on('lockSecret', (code) => {
     const p = players[socket.id];
-    if (!p) return;
+    if (!p) {
+      console.log(`Lock secret failed: player ${socket.id} not found`);
+      return;
+    }
     p.secret = code;
     p.lockedIn = true;
+    console.log(`Player ${p.name} locked secret: ${code}`);
     const opponent = players[p.opponentId];
-    if (opponent?.lockedIn) {
+    if (opponent && opponent.lockedIn) {
+      console.log(`Both players locked in: ${p.name} and ${opponent.name}`);
       io.to(socket.id).emit('startGame', p.turn);
       io.to(p.opponentId).emit('startGame', opponent.turn);
     } else {
+      console.log(`Waiting for opponent ${p.opponentId} to lock in`);
       io.to(p.opponentId).emit('opponentLocked');
     }
   });
@@ -132,7 +151,10 @@ io.on('connection', (socket) => {
   socket.on('submitGuess', (guess) => {
     const p = players[socket.id];
     const opponent = players[p?.opponentId];
-    if (!p || !opponent || !p.turn) return;
+    if (!p || !opponent || !p.turn) {
+      console.log(`Submit guess failed: player=${socket.id}, opponent=${p?.opponentId}, turn=${p?.turn}`);
+      return;
+    }
     const feedback = emojiFeedback(guess, opponent.secret);
     const correct = guess === opponent.secret;
     p.guesses.push({ guess, feedback, correct });
@@ -140,9 +162,11 @@ io.on('connection', (socket) => {
     p.turn = false;
     opponent.turn = true;
     opponent.lastTurnTime = Date.now();
+    console.log(`Guess by ${p.name}: ${guess}, Feedback: ${feedback}`);
     io.to(socket.id).emit('guessResult', { guess, feedback });
     io.to(p.opponentId).emit('opponentGuess', { guess, feedback });
     if (correct) {
+      console.log(`${p.name} won against ${opponent.name}`);
       endGame(socket.id, p.opponentId, 'win');
     }
   });
@@ -151,15 +175,16 @@ io.on('connection', (socket) => {
     const p = players[socket.id];
     const oppId = p?.opponentId;
     if (p?.inGame && players[oppId]) {
+      console.log(`Player ${p.name} disconnected, ending game`);
       endGame(oppId, socket.id, 'win');
     }
     delete players[socket.id];
-    updateLobby();
     console.log('User disconnected:', socket.id);
+    updateLobby();
   });
 });
 
 const port = process.env.PORT || 3000;
-server.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+app.listen(port, () => {
+  console.log('Server started on port', port);
 });
