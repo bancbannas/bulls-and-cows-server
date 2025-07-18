@@ -5,179 +5,152 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: '*'
+    origin: '*',
   }
 });
 
-const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
-let players = {}; // socket.id => { name, inGame, opponent, secret, guesses }
-let nameToSocketId = {}; // name => socket.id
+const players = {}; // playerName => { socketId, inGame, opponentName, secret }
 
 io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
+  console.log(`User connected: ${socket.id}`);
 
   socket.on('registerName', (name) => {
-    console.log('Received registerName on socket:', socket.id, 'Name:', name);
+    console.log(`Received registerName on socket: ${socket.id} Name: ${name}`);
 
-    // Prevent duplicate names
-    if (Object.values(players).some(p => p.name === name)) {
-      socket.emit('nameTaken');
-      return;
-    }
-
-    players[socket.id] = {
-      name,
-      inGame: false,
-      opponent: null,
-      secret: null,
-      guesses: []
-    };
-    nameToSocketId[name] = socket.id;
-
-    console.log(`Player registered: ${name}, ID: ${socket.id}`);
-    socket.emit('nameRegistered');
-    updateLobby();
-  });
-
-  socket.on('challengePlayer', (targetId) => {
-    const challenger = players[socket.id];
-    const target = players[targetId];
-
-    if (!challenger || !target) {
-      console.log('Challenge failed:\n', {
-        'challenger socket': socket.id,
-        'target socket': targetId,
-        'challenger found': !!challenger,
-        'target found': !!target,
-        'challenger inGame': challenger?.inGame,
-        'target inGame': target?.inGame
-      });
-      return;
-    }
-
-    if (challenger.inGame || target.inGame) return;
-
-    target.opponent = socket.id;
-    challenger.opponent = targetId;
-
-    io.to(targetId).emit('incomingChallenge', challenger.name);
-    console.log(`Challenge sent from ${challenger.name} to ${target.name}`);
-  });
-
-  socket.on('acceptChallenge', () => {
-    const accepter = players[socket.id];
-    const challengerId = accepter.opponent;
-    const challenger = players[challengerId];
-
-    if (!challenger || challenger.opponent !== socket.id) return;
-
-    accepter.inGame = true;
-    challenger.inGame = true;
-
-    io.to(socket.id).emit('challengeAccepted');
-    io.to(challengerId).emit('challengeAccepted');
-
-    console.log(`Challenge accepted: ${challenger.name} vs ${accepter.name}`);
-    updateLobby();
-  });
-
-  socket.on('lockSecret', (code) => {
-    const player = players[socket.id];
-    if (!player) return;
-    player.secret = code;
-    console.log(`Player ${player.name} locked secret: ${code}`);
-
-    const opponentId = player.opponent;
-    const opponent = players[opponentId];
-    if (opponent) {
-      io.to(opponentId).emit('opponentLocked');
-      if (opponent.secret) {
-        // Start the game: challenged player goes first
-        const challengerId = opponent.opponent === socket.id ? opponentId : socket.id;
-        io.to(challengerId).emit('startGame', true);
-        io.to(socket.id === challengerId ? opponentId : socket.id).emit('startGame', false);
+    // Avoid duplicate name conflict by kicking old session
+    Object.entries(players).forEach(([existingName, data]) => {
+      if (existingName === name && data.socketId !== socket.id) {
+        io.to(data.socketId).emit('forceDisconnect');
+        delete players[existingName];
       }
-    } else {
-      console.log(`Opponent ${opponentId} not found for ${player.name}`);
+    });
+
+    players[name] = {
+      socketId: socket.id,
+      inGame: false,
+      opponentName: null,
+      secret: null
+    };
+    socket.data.playerName = name;
+
+    io.to(socket.id).emit('nameRegistered');
+    io.emit('updatePlayerList', getAvailablePlayers());
+    console.log(`Player registered: ${name}, ID: ${socket.id}`);
+  });
+
+  socket.on('challengePlayer', (targetName) => {
+    const challengerName = socket.data.playerName;
+    const challenger = players[challengerName];
+    const target = players[targetName];
+
+    if (!challenger || !target || challenger.inGame || target.inGame) {
+      console.log('Challenge failed: invalid challenger or target');
+      return;
+    }
+
+    io.to(target.socketId).emit('challengeReceived', challengerName);
+    console.log(`Challenge sent from ${challengerName} to ${targetName}`);
+  });
+
+  socket.on('acceptChallenge', (challengerName) => {
+    const opponentName = socket.data.playerName;
+    const challenger = players[challengerName];
+    const opponent = players[opponentName];
+
+    if (!challenger || !opponent) return;
+
+    challenger.inGame = true;
+    opponent.inGame = true;
+    challenger.opponentName = opponentName;
+    opponent.opponentName = challengerName;
+
+    io.to(challenger.socketId).emit('redirectToMatch');
+    io.to(opponent.socketId).emit('redirectToMatch');
+
+    console.log(`Challenge accepted: ${challengerName} vs ${opponentName}`);
+  });
+
+  socket.on('lockSecret', (secret) => {
+    const name = socket.data.playerName;
+    const player = players[name];
+    if (!player) return;
+
+    player.secret = secret;
+    console.log(`Player ${name} locked secret: ${secret}`);
+
+    const opponentName = player.opponentName;
+    const opponent = players[opponentName];
+
+    if (opponent && opponent.secret) {
+      // Randomly decide who starts
+      const turn = Math.random() < 0.5 ? name : opponentName;
+      io.to(players[turn].socketId).emit('startGame', true);
+      io.to(players[turn === name ? opponentName : name].socketId).emit('startGame', false);
+    } else if (opponent) {
+      io.to(opponent.socketId).emit('opponentLocked');
     }
   });
 
   socket.on('submitGuess', (guess) => {
-    const player = players[socket.id];
-    if (!player || !player.opponent) return;
+    const name = socket.data.playerName;
+    const player = players[name];
+    if (!player) return;
 
-    const opponent = players[player.opponent];
+    const opponent = players[player.opponentName];
     if (!opponent || !opponent.secret) return;
 
     const feedback = getFeedback(guess, opponent.secret);
-    io.to(socket.id).emit('guessResult', { guess, feedback });
-    io.to(player.opponent).emit('opponentGuess', { guess, feedback });
+    io.to(player.socketId).emit('guessResult', { guess, feedback });
+    io.to(opponent.socketId).emit('opponentGuess', { guess, feedback });
 
     if (feedback === '🐂🐂🐂🐂') {
-      io.to(socket.id).emit('gameOver', 'win');
-      io.to(player.opponent).emit('gameOver', 'lose');
-      endGame(socket.id);
+      io.to(player.socketId).emit('gameOver', 'win');
+      io.to(opponent.socketId).emit('gameOver', 'lose');
+      resetGame(name, player.opponentName);
     }
   });
 
   socket.on('disconnect', () => {
-    const player = players[socket.id];
-    if (!player) return;
+    const name = socket.data.playerName;
+    console.log(`User disconnected: ${socket.id}`);
 
-    const opponentId = player.opponent;
-    const opponent = players[opponentId];
+    if (!name) return;
+
+    const player = players[name];
+    const opponentName = player?.opponentName;
+    const opponent = players[opponentName];
 
     if (opponent) {
-      io.to(opponentId).emit('gameOver', 'opponentDisconnected');
-      opponent.inGame = false;
-      opponent.opponent = null;
-      opponent.secret = null;
-      opponent.guesses = [];
+      io.to(opponent.socketId).emit('gameOver', 'opponent_disconnected');
+      resetGame(name, opponentName);
     }
 
-    console.log(`Player ${player.name} disconnected, ending game`);
-    delete nameToSocketId[player.name];
-    delete players[socket.id];
-    updateLobby();
+    delete players[name];
+    io.emit('updatePlayerList', getAvailablePlayers());
   });
 
-  function updateLobby() {
-    const lobby = Object.entries(players).map(([id, p]) => ({
-      id,
-      name: p.name,
-      inGame: p.inGame
-    }));
-    io.emit('updateLobby', lobby);
+  function resetGame(name1, name2) {
+    if (players[name1]) {
+      players[name1].inGame = false;
+      players[name1].opponentName = null;
+      players[name1].secret = null;
+    }
+    if (players[name2]) {
+      players[name2].inGame = false;
+      players[name2].opponentName = null;
+      players[name2].secret = null;
+    }
   }
 
-  function endGame(id) {
-    const player = players[id];
-    const opponentId = player.opponent;
-    const opponent = players[opponentId];
-
-    if (player) {
-      player.inGame = false;
-      player.opponent = null;
-      player.secret = null;
-      player.guesses = [];
-    }
-
-    if (opponent) {
-      opponent.inGame = false;
-      opponent.opponent = null;
-      opponent.secret = null;
-      opponent.guesses = [];
-    }
-
-    updateLobby();
+  function getAvailablePlayers() {
+    return Object.entries(players)
+      .filter(([_, p]) => !p.inGame)
+      .map(([name]) => name);
   }
 
   function getFeedback(guess, secret) {
-    let bulls = 0, cows = 0;
+    let bulls = 0;
+    let cows = 0;
     for (let i = 0; i < 4; i++) {
       if (guess[i] === secret[i]) {
         bulls++;
@@ -187,4 +160,8 @@ io.on('connection', (socket) => {
     }
     return '🐂'.repeat(bulls) + '🐄'.repeat(cows) + '💩'.repeat(4 - bulls - cows);
   }
+});
+
+server.listen(10000, () => {
+  console.log('Server running on port 10000');
 });
