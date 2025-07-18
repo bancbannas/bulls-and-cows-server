@@ -125,19 +125,29 @@ io.on('connection', (socket) => {
     console.log(`Challenge sent from ${challenger.name} to ${target.name}`);
   });
 
-  socket.on('acceptChallenge', () => {
-    const player = players[socket.id];
-    const challengerId = player?.pendingChallengeFrom;
-    const challenger = players[challengerId];
+socket.on('acceptChallenge', () => {
+  const player = players[socket.id];
+  const challengerId = player?.pendingChallengeFrom;
+  const challenger = players[challengerId];
 
-    if (player && challenger) {
-      player.lockedIn = false;
-      challenger.lockedIn = false;
-      io.to(challengerId).emit('challengeAccepted');
-      io.to(socket.id).emit('challengeAccepted');
-      console.log(`Challenge accepted: ${challenger.name} vs ${player.name}`);
-    }
-  });
+  if (player && challenger) {
+    // 🟢 Ensure both players are re-linked properly
+    player.opponentId = challengerId;
+    player.inGame = true;
+    player.turn = false;
+    player.lockedIn = false;
+
+    challenger.opponentId = socket.id;
+    challenger.inGame = true;
+    challenger.turn = true;
+    challenger.lockedIn = false;
+
+    io.to(challengerId).emit('challengeAccepted');
+    io.to(socket.id).emit('challengeAccepted');
+
+    console.log(`Challenge accepted: ${challenger.name} vs ${player.name}`);
+  }
+});
 
   socket.on('lockSecret', (code) => {
     const p = players[socket.id];
