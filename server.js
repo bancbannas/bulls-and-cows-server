@@ -29,7 +29,7 @@ function emojiFeedback(guess, target) {
   for (const d in guessMap) {
     if (targetMap[d]) cows += Math.min(guessMap[d], targetMap[d]);
   }
-  return 'B'.repeat(bulls) + 'C'.repeat(cows) + 'S'.repeat(4 - bulls - cows);
+  return '🐂'.repeat(bulls) + '🐄'.repeat(cows) + '💩'.repeat(4 - bulls - cows);
 }
 
 function updateLobby() {
