@@ -1,5 +1,3 @@
-// ✅ PATCHED server.js (revised to allow re-registering same name on same socket, and emit notRegistered)
-
 const express = require('express');
 const http = require('http');
 const path = require('path');
@@ -81,19 +79,15 @@ io.on('connection', (socket) => {
   socket.on('registerName', (name) => {
     console.log('Received registerName on socket:', socket.id, 'Name:', name);
 
-    if (players[socket.id]) {
-      console.log('Player already registered on this socket:', socket.id);
-      socket.emit('nameRegistered');
-      return;
+    // Clean up old sockets with same name
+    for (const [id, p] of Object.entries(players)) {
+      if (p.name === name) {
+        console.log(`Removing stale player with name ${name}, old socket: ${id}`);
+        delete players[id];
+      }
     }
 
-    const nameTakenByOther = Object.entries(players).find(([id, p]) => p.name === name && id !== socket.id);
-    if (nameTakenByOther) {
-      console.log('Name taken: ' + name);
-      socket.emit('nameTaken');
-      return;
-    }
-
+    // Register the current socket
     players[socket.id] = {
       name,
       inGame: false,
@@ -104,6 +98,7 @@ io.on('connection', (socket) => {
       turn: false,
       lockedIn: false
     };
+
     console.log('Player registered: ' + name + ', ID: ' + socket.id);
     socket.emit('nameRegistered');
     updateLobby();
@@ -119,11 +114,13 @@ io.on('connection', (socket) => {
     p.secret = code;
     p.lockedIn = true;
     console.log('Player ' + p.name + ' locked secret: ' + code);
+
     const opponent = players[p.opponentId];
     if (!opponent) {
       console.log('Opponent ' + p.opponentId + ' not found for ' + p.name);
       return;
     }
+
     if (opponent.lockedIn) {
       console.log('Both players locked in: ' + p.name + ' and ' + opponent.name);
       io.to(socket.id).emit('startGame', p.turn);
