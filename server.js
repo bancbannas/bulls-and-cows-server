@@ -76,27 +76,38 @@ setInterval(checkTimeouts, 10000);
 io.on('connection', (socket) => {
   console.log('User connected: ' + socket.id);
 
-  socket.on('registerName', (name) => {
-    console.log('Received registerName on socket:', socket.id, 'Name:', name);
-    if (Object.values(players).some(p => p.name === name)) {
-      console.log('Name taken: ' + name);
-      socket.emit('nameTaken');
-    } else {
-      players[socket.id] = {
-        name,
-        inGame: false,
-        opponentId: null,
-        secret: '',
-        guesses: [],
-        lastTurnTime: null,
-        turn: false,
-        lockedIn: false
-      };
-      console.log('Player registered: ' + name + ', ID: ' + socket.id);
-      socket.emit('nameRegistered'); // ✅ NEW: Confirm registration to client
-      updateLobby();
-    }
-  });
+socket.on('registerName', (name) => {
+  console.log('Received registerName on socket:', socket.id, 'Name:', name);
+
+  // Check if this socket ID is already registered
+  if (players[socket.id]) {
+    console.log('Player already registered on this socket:', socket.id);
+    socket.emit('nameRegistered');
+    return;
+  }
+
+  // Check if another socket is already using the same name
+  if (Object.values(players).some(p => p.name === name)) {
+    console.log('Name taken: ' + name);
+    socket.emit('nameTaken');
+    return;
+  }
+
+  // Register new player
+  players[socket.id] = {
+    name,
+    inGame: false,
+    opponentId: null,
+    secret: '',
+    guesses: [],
+    lastTurnTime: null,
+    turn: false,
+    lockedIn: false
+  };
+  console.log('Player registered: ' + name + ', ID: ' + socket.id);
+  socket.emit('nameRegistered');
+  updateLobby();
+});
 
   socket.on('challengePlayer', function(targetId) {
     const challenger = players[socket.id];
