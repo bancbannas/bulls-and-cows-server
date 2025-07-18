@@ -32,11 +32,9 @@ function emojiFeedback(guess, target) {
 }
 
 function updateLobby() {
-  const lobby = Object.entries(players).map(function(entry) {
-    const id = entry[0];
-    const p = entry[1];
-    return { id: id, name: p.name, inGame: p.inGame };
-  });
+  const lobby = Object.entries(players).map(([id, p]) => ({
+    id, name: p.name, inGame: p.inGame
+  }));
   io.emit('updateLobby', lobby);
 }
 
@@ -64,8 +62,7 @@ function endGame(winnerId, loserId, result) {
 
 function checkTimeouts() {
   const now = Date.now();
-  for (const id in players) {
-    const p = players[id];
+  for (const [id, p] of Object.entries(players)) {
     if (p.inGame && p.lastTurnTime && now - p.lastTurnTime > 60000) {
       const opponent = players[p.opponentId];
       if (opponent) {
@@ -76,16 +73,17 @@ function checkTimeouts() {
 }
 setInterval(checkTimeouts, 10000);
 
-io.on('connection', function(socket) {
+io.on('connection', (socket) => {
   console.log('User connected: ' + socket.id);
 
-  socket.on('registerName', function(name) {
-    if (Object.values(players).some(function(p) { return p.name === name; })) {
+  socket.on('registerName', (name) => {
+    console.log('Received registerName on socket:', socket.id, 'Name:', name);
+    if (Object.values(players).some(p => p.name === name)) {
       console.log('Name taken: ' + name);
       socket.emit('nameTaken');
     } else {
       players[socket.id] = {
-        name: name,
+        name,
         inGame: false,
         opponentId: null,
         secret: '',
@@ -95,6 +93,7 @@ io.on('connection', function(socket) {
         lockedIn: false
       };
       console.log('Player registered: ' + name + ', ID: ' + socket.id);
+      socket.emit('nameRegistered'); // ✅ NEW: Confirm registration to client
       updateLobby();
     }
   });
@@ -135,10 +134,11 @@ io.on('connection', function(socket) {
     }
   });
 
-  socket.on('lockSecret', function(code) {
+  socket.on('lockSecret', (code) => {
     const p = players[socket.id];
     if (!p) {
       console.log('Lock secret failed: player ' + socket.id + ' not found');
+      socket.emit('notRegistered');
       return;
     }
     p.secret = code;
@@ -159,34 +159,10 @@ io.on('connection', function(socket) {
     }
   });
 
-  socket.on('submitGuess', function(guess) {
+  socket.on('disconnect', () => {
     const p = players[socket.id];
-    const opponent = p && p.opponentId ? players[p.opponentId] : null;
-    if (!p || !opponent || !p.turn) {
-      console.log('Submit guess failed: player=' + socket.id + ', opponent=' + (p ? p.opponentId : 'null') + ', turn=' + (p ? p.turn : 'null'));
-      return;
-    }
-    const feedback = emojiFeedback(guess, opponent.secret);
-    const correct = guess === opponent.secret;
-    p.guesses.push({ guess: guess, feedback: feedback, correct: correct });
-    const now = Date.now();
-    p.lastTurnTime = now;
-    opponent.lastTurnTime = now;
-    p.turn = false;
-    opponent.turn = true;
-    console.log('Guess by ' + p.name + ': ' + guess + ', Feedback: ' + feedback);
-    io.to(socket.id).emit('guessResult', { guess: guess, feedback: feedback });
-    io.to(p.opponentId).emit('opponentGuess', { guess: guess, feedback: feedback });
-    if (correct) {
-      console.log(p.name + ' won against ' + opponent.name);
-      endGame(socket.id, p.opponentId, 'win');
-    }
-  });
-
-  socket.on('disconnect', function() {
-    const p = players[socket.id];
-    const oppId = p && p.opponentId;
-    if (p && p.inGame && players[oppId]) {
+    const oppId = p?.opponentId;
+    if (p?.inGame && players[oppId]) {
       console.log('Player ' + p.name + ' disconnected, ending game');
       endGame(oppId, socket.id, 'win');
     }
@@ -197,6 +173,7 @@ io.on('connection', function(socket) {
 });
 
 const port = process.env.PORT || 3000;
-server.listen(port, function() {
+server.listen(port, () => {
   console.log('Server running on port ' + port);
 });
+
