@@ -17,7 +17,6 @@ io.on('connection', (socket) => {
   socket.on('registerName', (name) => {
     console.log(`Received registerName on socket: ${socket.id} Name: ${name}`);
 
-    // Avoid duplicate name conflict by kicking old session
     Object.entries(players).forEach(([existingName, data]) => {
       if (existingName === name && data.socketId !== socket.id) {
         io.to(data.socketId).emit('forceDisconnect');
@@ -34,7 +33,7 @@ io.on('connection', (socket) => {
     socket.data.playerName = name;
 
     io.to(socket.id).emit('nameRegistered');
-    io.emit('updatePlayerList', getAvailablePlayers());
+    io.emit('updateLobby', getLobbySnapshot());
     console.log(`Player registered: ${name}, ID: ${socket.id}`);
   });
 
@@ -67,6 +66,8 @@ io.on('connection', (socket) => {
     io.to(challenger.socketId).emit('redirectToMatch');
     io.to(opponent.socketId).emit('redirectToMatch');
 
+    io.emit('updateLobby', getLobbySnapshot());
+
     console.log(`Challenge accepted: ${challengerName} vs ${opponentName}`);
   });
 
@@ -82,7 +83,6 @@ io.on('connection', (socket) => {
     const opponent = players[opponentName];
 
     if (opponent && opponent.secret) {
-      // Randomly decide who starts
       const turn = Math.random() < 0.5 ? name : opponentName;
       io.to(players[turn].socketId).emit('startGame', true);
       io.to(players[turn === name ? opponentName : name].socketId).emit('startGame', false);
@@ -107,6 +107,7 @@ io.on('connection', (socket) => {
       io.to(player.socketId).emit('gameOver', 'win');
       io.to(opponent.socketId).emit('gameOver', 'lose');
       resetGame(name, player.opponentName);
+      io.emit('updateLobby', getLobbySnapshot());
     }
   });
 
@@ -126,7 +127,7 @@ io.on('connection', (socket) => {
     }
 
     delete players[name];
-    io.emit('updatePlayerList', getAvailablePlayers());
+    io.emit('updateLobby', getLobbySnapshot());
   });
 
   function resetGame(name1, name2) {
@@ -142,10 +143,11 @@ io.on('connection', (socket) => {
     }
   }
 
-  function getAvailablePlayers() {
-    return Object.entries(players)
-      .filter(([_, p]) => !p.inGame)
-      .map(([name]) => name);
+  function getLobbySnapshot() {
+    return Object.entries(players).map(([name, data]) => ({
+      name,
+      inGame: data.inGame
+    }));
   }
 
   function getFeedback(guess, secret) {
