@@ -79,6 +79,7 @@ io.on('connection', (socket) => {
 
   socket.on('registerName', (name) => {
     if (Object.values(players).some(p => p.name === name)) {
+      console.log(`Name taken: ${name}`);
       socket.emit('nameTaken');
     } else {
       players[socket.id] = {
@@ -150,6 +151,14 @@ socket.on('lockSecret', (code) => {
   } else {
     console.log(`Waiting for opponent ${p.opponentId} to lock in`);
     io.to(p.opponentId).emit('opponentLocked');
+    // Retry after 1 second to handle race conditions
+    setTimeout(() => {
+      if (p.lockedIn && opponent.lockedIn) {
+        console.log(`Retry: Both players locked in: ${p.name} and ${opponent.name}`);
+        io.to(socket.id).emit('startGame', p.turn);
+        io.to(p.opponentId).emit('startGame', opponent.turn);
+      }
+    }, 1000);
   }
 });
 
