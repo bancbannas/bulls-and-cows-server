@@ -79,7 +79,7 @@ io.on('connection', (socket) => {
   socket.on('registerName', (name) => {
     console.log('Received registerName on socket:', socket.id, 'Name:', name);
 
-    // Clean up old sockets with same name
+    // Remove any stale player entries with the same name
     for (const [id, p] of Object.entries(players)) {
       if (p.name === name) {
         console.log(`Removing stale player with name ${name}, old socket: ${id}`);
@@ -87,7 +87,7 @@ io.on('connection', (socket) => {
       }
     }
 
-    // Register the current socket
+    // Register new player
     players[socket.id] = {
       name,
       inGame: false,
@@ -102,6 +102,47 @@ io.on('connection', (socket) => {
     console.log('Player registered: ' + name + ', ID: ' + socket.id);
     socket.emit('nameRegistered');
     updateLobby();
+  });
+
+  socket.on('challengePlayer', (targetId) => {
+    const challenger = players[socket.id];
+    const target = players[targetId];
+
+    if (challenger && target && !challenger.inGame && !target.inGame) {
+      target.pendingChallenge = socket.id;
+      console.log(`Challenge sent from ${challenger.name} to ${target.name}`);
+      io.to(targetId).emit('incomingChallenge', challenger.name);
+    } else {
+      console.log(`Challenge failed:`);
+      console.log('  challenger socket:', socket.id);
+      console.log('  target socket:', targetId);
+      console.log('  challenger found:', !!challenger, 'inGame:', challenger?.inGame);
+      console.log('  target found:', !!target, 'inGame:', target?.inGame);
+    }
+  });
+
+  socket.on('acceptChallenge', () => {
+    const challenged = players[socket.id];
+    const challengerId = challenged?.pendingChallenge;
+    const challenger = players[challengerId];
+
+    if (challenger && challenged) {
+      challenger.inGame = challenged.inGame = true;
+      challenger.opponentId = socket.id;
+      challenged.opponentId = challengerId;
+      challenger.turn = false;
+      challenged.turn = true;
+      const now = Date.now();
+      challenger.lastTurnTime = now;
+      challenged.lastTurnTime = now;
+
+      console.log(`Challenge accepted: ${challenger.name} vs ${challenged.name}`);
+      io.to(challengerId).emit('challengeAccepted');
+      io.to(socket.id).emit('challengeAccepted');
+      updateLobby();
+    } else {
+      console.log(`Accept challenge failed: challenged=${socket.id}, challenger=${challengerId}`);
+    }
   });
 
   socket.on('lockSecret', (code) => {
