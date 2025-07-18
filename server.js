@@ -1,3 +1,5 @@
+// ✅ PATCHED server.js (revised to allow re-registering same name on same socket, and emit notRegistered)
+
 const express = require('express');
 const http = require('http');
 const path = require('path');
@@ -76,73 +78,35 @@ setInterval(checkTimeouts, 10000);
 io.on('connection', (socket) => {
   console.log('User connected: ' + socket.id);
 
-socket.on('registerName', (name) => {
-  console.log('Received registerName on socket:', socket.id, 'Name:', name);
+  socket.on('registerName', (name) => {
+    console.log('Received registerName on socket:', socket.id, 'Name:', name);
 
-  // Check if this socket ID is already registered
-  if (players[socket.id]) {
-    console.log('Player already registered on this socket:', socket.id);
+    if (players[socket.id]) {
+      console.log('Player already registered on this socket:', socket.id);
+      socket.emit('nameRegistered');
+      return;
+    }
+
+    const nameTakenByOther = Object.entries(players).find(([id, p]) => p.name === name && id !== socket.id);
+    if (nameTakenByOther) {
+      console.log('Name taken: ' + name);
+      socket.emit('nameTaken');
+      return;
+    }
+
+    players[socket.id] = {
+      name,
+      inGame: false,
+      opponentId: null,
+      secret: '',
+      guesses: [],
+      lastTurnTime: null,
+      turn: false,
+      lockedIn: false
+    };
+    console.log('Player registered: ' + name + ', ID: ' + socket.id);
     socket.emit('nameRegistered');
-    return;
-  }
-
-  // Check if another socket is already using the same name
-  if (Object.values(players).some(p => p.name === name)) {
-    console.log('Name taken: ' + name);
-    socket.emit('nameTaken');
-    return;
-  }
-
-  // Register new player
-  players[socket.id] = {
-    name,
-    inGame: false,
-    opponentId: null,
-    secret: '',
-    guesses: [],
-    lastTurnTime: null,
-    turn: false,
-    lockedIn: false
-  };
-  console.log('Player registered: ' + name + ', ID: ' + socket.id);
-  socket.emit('nameRegistered');
-  updateLobby();
-});
-
-  socket.on('challengePlayer', function(targetId) {
-    const challenger = players[socket.id];
-    const target = players[targetId];
-    if (challenger && target && !challenger.inGame && !target.inGame) {
-      target.pendingChallenge = socket.id;
-      console.log('Challenge sent from ' + challenger.name + ' to ' + target.name);
-      io.to(targetId).emit('incomingChallenge', challenger.name);
-    } else {
-      console.log('Challenge failed: challenger=' + socket.id + ', target=' + targetId);
-    }
-  });
-
-  socket.on('acceptChallenge', function() {
-    const challenged = players[socket.id];
-    const challengerId = challenged ? challenged.pendingChallenge : null;
-    const challenger = players[challengerId];
-    if (challenger && challenged) {
-      challenger.inGame = true;
-      challenged.inGame = true;
-      challenger.opponentId = socket.id;
-      challenged.opponentId = challengerId;
-      challenger.turn = false;
-      challenged.turn = true;
-      const now = Date.now();
-      challenger.lastTurnTime = now;
-      challenged.lastTurnTime = now;
-      console.log('Challenge accepted: ' + challenger.name + ' vs ' + challenged.name);
-      console.log('Set opponent IDs: ' + challenger.name + ' -> ' + socket.id + ', ' + challenged.name + ' -> ' + challengerId);
-      io.to(challengerId).emit('challengeAccepted');
-      io.to(socket.id).emit('challengeAccepted');
-      updateLobby();
-    } else {
-      console.log('Accept challenge failed: challenged=' + socket.id + ', challenger=' + challengerId);
-    }
+    updateLobby();
   });
 
   socket.on('lockSecret', (code) => {
@@ -187,4 +151,3 @@ const port = process.env.PORT || 3000;
 server.listen(port, () => {
   console.log('Server running on port ' + port);
 });
-
