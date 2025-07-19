@@ -19,7 +19,7 @@ io.on('connection', (socket) => {
 
     const existing = players[name];
     if (existing) {
-      if (existing.socketId !== socket.id) {
+      if (existing.socketId && existing.socketId !== socket.id) {
         io.to(existing.socketId).emit('forceDisconnect');
       }
       if (existing.timer) {
@@ -86,23 +86,32 @@ io.on('connection', (socket) => {
     const player = players[name];
     if (!player) return;
 
-    if (!player.opponentName) {
-      io.to(player.socketId).emit('gameCanceled');
+    const opponentName = player.opponentName;
+    const opponent = players[opponentName];
+
+    if (!opponentName || !opponent) {
+      if (player.socketId) {
+        io.to(player.socketId).emit('gameCanceled');
+      }
+      resetGame(name, opponentName);
+      console.log(`Game canceled for ${name}: opponent not found`);
       return;
     }
 
     player.secret = secret;
     console.log(`Player ${name} locked secret: ${secret}`);
 
-    const opponentName = player.opponentName;
-    const opponent = players[opponentName];
-
-    if (opponent && opponent.secret) {
+    if (opponent.secret) {
       const firstTurn = Math.random() < 0.5 ? name : opponentName;
       players[firstTurn].currentTurn = true;
-      io.to(players[firstTurn].socketId).emit('startGame', true);
-      io.to(players[firstTurn === name ? opponentName : name].socketId).emit('startGame', false);
-    } else if (opponent && !opponent.disconnected && opponent.socketId) {
+      if (players[firstTurn].socketId) {
+        io.to(players[firstTurn].socketId).emit('startGame', true);
+      }
+      const other = firstTurn === name ? opponentName : name;
+      if (players[other].socketId) {
+        io.to(players[other].socketId).emit('startGame', false);
+      }
+    } else if (!opponent.disconnected && opponent.socketId) {
       io.to(opponent.socketId).emit('opponentLocked');
     }
   });
@@ -173,7 +182,7 @@ io.on('connection', (socket) => {
           io.emit('updateLobby', getLobbySnapshot());
           console.log(`Cleanup timer fired for disconnected player: ${name}`);
         }
-      }, 30000); // Increased to 30s for slower loads on Render
+      }, 60000); // Increased to 60s for more time to lock secrets
     } else {
       delete players[name];
       io.emit('updateLobby', getLobbySnapshot());
