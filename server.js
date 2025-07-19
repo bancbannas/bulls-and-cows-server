@@ -45,6 +45,7 @@ io.on('connection', (socket) => {
     io.to(socket.id).emit('nameRegistered');
     io.emit('updateLobby', getLobbySnapshot());
     console.log(`Player registered: ${name}, ID: ${socket.id}`);
+    broadcastChat(`${name} has joined the lobby.`);
   });
 
   socket.on('challengePlayer', (targetName) => {
@@ -79,6 +80,7 @@ io.on('connection', (socket) => {
     io.emit('updateLobby', getLobbySnapshot());
 
     console.log(`Challenge accepted: ${challengerName} vs ${opponentName}`);
+    broadcastChat(`${challengerName} and ${opponentName} are now in a game.`);
   });
 
   socket.on('lockSecret', (secret) => {
@@ -124,11 +126,11 @@ io.on('connection', (socket) => {
     const opponent = players[player.opponentName];
     if (!opponent || !opponent.secret) return;
 
-    const feedback = getFeedback(guess, opponent.secret);
-    io.to(player.socketId).emit('guessResult', { guess, feedback });
-    io.to(opponent.socketId).emit('opponentGuess', { guess, feedback });
+    const { bulls, cows } = getBullsAndCows(guess, opponent.secret);
+    io.to(player.socketId).emit('guessResult', { guess, bulls, cows });
+    io.to(opponent.socketId).emit('opponentGuess', { guess, bulls, cows });
 
-    if (feedback === '🐂🐂🐂🐂') {
+    if (bulls === 4) {
       io.to(player.socketId).emit('gameOver', 'win');
       io.to(opponent.socketId).emit('gameOver', 'lose');
       resetGame(name, player.opponentName);
@@ -181,13 +183,23 @@ io.on('connection', (socket) => {
           delete players[name];
           io.emit('updateLobby', getLobbySnapshot());
           console.log(`Cleanup timer fired for disconnected player: ${name}`);
+          broadcastChat(`${name} has left the lobby.`);
         }
-      }, 60000); // Increased to 60s for more time to lock secrets
+      }, 60000); // 60s
     } else {
       delete players[name];
       io.emit('updateLobby', getLobbySnapshot());
+      broadcastChat(`${name} has left the lobby.`);
     }
   });
+
+  socket.on('chatMessage', ({ name, message }) => {
+    broadcastChat(`${name}: ${message}`);
+  });
+
+  function broadcastChat(message) {
+    io.emit('chatMessage', { name: 'System', message });
+  }
 
   function resetGame(name1, name2) {
     if (players[name1]) {
@@ -221,7 +233,7 @@ io.on('connection', (socket) => {
     }));
   }
 
-  function getFeedback(guess, secret) {
+  function getBullsAndCows(guess, secret) {
     let bulls = 0;
     let cows = 0;
     for (let i = 0; i < 4; i++) {
@@ -231,7 +243,7 @@ io.on('connection', (socket) => {
         cows++;
       }
     }
-    return '🐂'.repeat(bulls) + '🐄'.repeat(cows) + '💩'.repeat(4 - bulls - cows);
+    return { bulls, cows };
   }
 });
 
