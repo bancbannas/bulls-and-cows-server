@@ -9,7 +9,7 @@ const io = new Server(server, {
   }
 });
 
-const players = {}; // playerName => { socketId, inGame, opponentName, secret, currentTurn }
+const players = {}; // playerName => { socketId, inGame, opponentName, secret, currentTurn, disconnected, timer }
 
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
@@ -17,20 +17,29 @@ io.on('connection', (socket) => {
   socket.on('registerName', (name) => {
     console.log(`Received registerName on socket: ${socket.id} Name: ${name}`);
 
-    Object.entries(players).forEach(([existingName, data]) => {
-      if (existingName === name && data.socketId !== socket.id) {
-        io.to(data.socketId).emit('forceDisconnect');
-        delete players[existingName];
+    const existing = players[name];
+    if (existing) {
+      if (existing.socketId !== socket.id) {
+        io.to(existing.socketId).emit('forceDisconnect');
       }
-    });
+      if (existing.timer) {
+        clearTimeout(existing.timer);
+        existing.timer = null;
+      }
+      existing.socketId = socket.id;
+      existing.disconnected = false;
+    } else {
+      players[name] = {
+        socketId: socket.id,
+        inGame: false,
+        opponentName: null,
+        secret: null,
+        currentTurn: false,
+        disconnected: false,
+        timer: null
+      };
+    }
 
-    players[name] = {
-      socketId: socket.id,
-      inGame: false,
-      opponentName: null,
-      secret: null,
-      currentTurn: false
-    };
     socket.data.playerName = name;
 
     io.to(socket.id).emit('nameRegistered');
@@ -77,6 +86,11 @@ io.on('connection', (socket) => {
     const player = players[name];
     if (!player) return;
 
+    if (!player.opponentName) {
+      io.to(player.socketId).emit('gameCanceled');
+      return;
+    }
+
     player.secret = secret;
     console.log(`Player ${name} locked secret: ${secret}`);
 
@@ -88,7 +102,7 @@ io.on('connection', (socket) => {
       players[firstTurn].currentTurn = true;
       io.to(players[firstTurn].socketId).emit('startGame', true);
       io.to(players[firstTurn === name ? opponentName : name].socketId).emit('startGame', false);
-    } else if (opponent) {
+    } else if (opponent && !opponent.disconnected && opponent.socketId) {
       io.to(opponent.socketId).emit('opponentLocked');
     }
   });
@@ -114,7 +128,7 @@ io.on('connection', (socket) => {
       // Switch turn
       player.currentTurn = false;
       opponent.currentTurn = true;
-      io.to(opponent.socketId).emit('startGame', true); // Opponent's turn now
+      io.to(opponent.socketId).emit('startGame', true);
     }
   });
 
@@ -123,7 +137,7 @@ io.on('connection', (socket) => {
     const player = players[name];
     if (!player || !player.currentTurn) return;
 
-    // Forfeit: Current player loses, opponent wins
+    // Forfeit
     const opponentName = player.opponentName;
     const opponent = players[opponentName];
 
@@ -142,30 +156,52 @@ io.on('connection', (socket) => {
     if (!name) return;
 
     const player = players[name];
-    const opponentName = player?.opponentName;
-    const opponent = players[opponentName];
+    if (!player) return;
 
-    if (opponent) {
-      io.to(opponent.socketId).emit('gameOver', 'opponent_disconnected');
-      resetGame(name, opponentName);
+    if (player.inGame) {
+      player.disconnected = true;
+      player.socketId = null;
+      player.timer = setTimeout(() => {
+        if (players[name] && players[name].disconnected) { // Check if still disconnected
+          const opponentName = player.opponentName;
+          const opponent = players[opponentName];
+          if (opponent && opponent.socketId) {
+            io.to(opponent.socketId).emit('gameOver', 'opponent_disconnected');
+          }
+          resetGame(name, opponentName);
+          delete players[name];
+          io.emit('updateLobby', getLobbySnapshot());
+          console.log(`Cleanup timer fired for disconnected player: ${name}`);
+        }
+      }, 30000); // Increased to 30s for slower loads on Render
+    } else {
+      delete players[name];
+      io.emit('updateLobby', getLobbySnapshot());
     }
-
-    delete players[name];
-    io.emit('updateLobby', getLobbySnapshot());
   });
 
   function resetGame(name1, name2) {
     if (players[name1]) {
+      if (players[name1].timer) {
+        clearTimeout(players[name1].timer);
+        players[name1].timer = null;
+      }
       players[name1].inGame = false;
       players[name1].opponentName = null;
       players[name1].secret = null;
       players[name1].currentTurn = false;
+      players[name1].disconnected = false;
     }
     if (players[name2]) {
+      if (players[name2].timer) {
+        clearTimeout(players[name2].timer);
+        players[name2].timer = null;
+      }
       players[name2].inGame = false;
       players[name2].opponentName = null;
       players[name2].secret = null;
       players[name2].currentTurn = false;
+      players[name2].disconnected = false;
     }
   }
 
