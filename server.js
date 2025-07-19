@@ -9,7 +9,7 @@ const io = new Server(server, {
   }
 });
 
-const players = {}; // playerName => { socketId, inGame, opponentName, secret }
+const players = {}; // playerName => { socketId, inGame, opponentName, secret, currentTurn }
 
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
@@ -28,7 +28,8 @@ io.on('connection', (socket) => {
       socketId: socket.id,
       inGame: false,
       opponentName: null,
-      secret: null
+      secret: null,
+      currentTurn: false
     };
     socket.data.playerName = name;
 
@@ -83,9 +84,10 @@ io.on('connection', (socket) => {
     const opponent = players[opponentName];
 
     if (opponent && opponent.secret) {
-      const turn = Math.random() < 0.5 ? name : opponentName;
-      io.to(players[turn].socketId).emit('startGame', true);
-      io.to(players[turn === name ? opponentName : name].socketId).emit('startGame', false);
+      const firstTurn = Math.random() < 0.5 ? name : opponentName;
+      players[firstTurn].currentTurn = true;
+      io.to(players[firstTurn].socketId).emit('startGame', true);
+      io.to(players[firstTurn === name ? opponentName : name].socketId).emit('startGame', false);
     } else if (opponent) {
       io.to(opponent.socketId).emit('opponentLocked');
     }
@@ -94,7 +96,7 @@ io.on('connection', (socket) => {
   socket.on('submitGuess', (guess) => {
     const name = socket.data.playerName;
     const player = players[name];
-    if (!player) return;
+    if (!player || !player.currentTurn) return;
 
     const opponent = players[player.opponentName];
     if (!opponent || !opponent.secret) return;
@@ -108,7 +110,29 @@ io.on('connection', (socket) => {
       io.to(opponent.socketId).emit('gameOver', 'lose');
       resetGame(name, player.opponentName);
       io.emit('updateLobby', getLobbySnapshot());
+    } else {
+      // Switch turn
+      player.currentTurn = false;
+      opponent.currentTurn = true;
+      io.to(opponent.socketId).emit('startGame', true); // Opponent's turn now
     }
+  });
+
+  socket.on('timerExpired', () => {
+    const name = socket.data.playerName;
+    const player = players[name];
+    if (!player || !player.currentTurn) return;
+
+    // Forfeit: Current player loses, opponent wins
+    const opponentName = player.opponentName;
+    const opponent = players[opponentName];
+
+    io.to(player.socketId).emit('gameOver', 'forfeit_lose');
+    io.to(opponent.socketId).emit('gameOver', 'forfeit_win');
+
+    resetGame(name, opponentName);
+    io.emit('updateLobby', getLobbySnapshot());
+    console.log(`Player ${name} forfeited due to timeout vs ${opponentName}`);
   });
 
   socket.on('disconnect', () => {
@@ -135,11 +159,13 @@ io.on('connection', (socket) => {
       players[name1].inGame = false;
       players[name1].opponentName = null;
       players[name1].secret = null;
+      players[name1].currentTurn = false;
     }
     if (players[name2]) {
       players[name2].inGame = false;
       players[name2].opponentName = null;
       players[name2].secret = null;
+      players[name2].currentTurn = false;
     }
   }
 
