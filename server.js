@@ -1,4 +1,3 @@
-```javascript
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -14,7 +13,7 @@ const io = new Server(server, {
 const players = {};
 
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  console.log(`Client connected: ${socket.id}`);
 
   socket.on('registerName', (name) => {
     console.log(`Received registerName on socket: ${socket.id} Name: ${name}`);
@@ -30,7 +29,7 @@ io.on('connection', (socket) => {
       }
       existing.socketId = socket.id;
       existing.disconnected = false;
-      existing.inGame = false; // Reset inGame on new registration
+      existing.inGame = false;
       existing.opponentName = null;
       existing.secret = null;
       existing.currentTurn = false;
@@ -202,7 +201,7 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     const name = socket.data.playerName;
-    console.log(`User disconnected: ${socket.id}`);
+    console.log(`Client disconnected: ${socket.id}`);
 
     if (!name) return;
 
@@ -219,7 +218,6 @@ io.on('connection', (socket) => {
       player.timer = setTimeout(() => {
         if (players[name] && players[name].disconnected) {
           if (opponent && opponent.disconnected) {
-            // Both players disconnected: reset game and update leaderboard
             players[name].losses += 1;
             if (opponent) players[opponentName].wins += 1;
             submitToLeaderboard(name, opponentName);
@@ -228,7 +226,6 @@ io.on('connection', (socket) => {
             broadcastChat(`Game between ${name} and ${opponentName} timed out due to inactivity.`);
             if (!opponent) delete players[name];
           } else if (opponent && opponent.socketId) {
-            // One player disconnected: opponent wins
             players[name].losses += 1;
             players[opponentName].wins += 1;
             submitToLeaderboard(name, opponentName);
@@ -237,7 +234,7 @@ io.on('connection', (socket) => {
             console.log(`Cleanup timer fired for disconnected player: ${name}`);
             broadcastChat(`${name} has left the lobby.`);
           }
-          delete players[name];
+          if (players[name]) delete players[name];
           io.emit('updateLobby', getLobbySnapshot());
           io.emit('leaderboardUpdate', getLeaderboard());
         }
