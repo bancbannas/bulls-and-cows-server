@@ -271,6 +271,10 @@ io.on('connection', (socket) => {
         clearTimeout(players[name1].timer);
         players[name1].timer = null;
       }
+      if (players[name1].startupTimer) {
+        clearTimeout(players[name1].startupTimer);
+        players[name1].startupTimer = null;
+      }
       players[name1].inGame = false;
       players[name1].opponentName = null;
       players[name1].secret = null;
@@ -281,6 +285,10 @@ io.on('connection', (socket) => {
       if (players[name2].timer) {
         clearTimeout(players[name2].timer);
         players[name2].timer = null;
+      }
+      if (players[name2].startupTimer) {
+        clearTimeout(players[name2].startupTimer);
+        players[name2].startupTimer = null;
       }
       players[name2].inGame = false;
       players[name2].opponentName = null;
@@ -370,7 +378,6 @@ io.on('connection', (socket) => {
       player.startupTimer = setTimeout(() => {
         if (players[playerName]) {
           console.log(`Startup grace period expired for ${playerName}`);
-          // Only cancel if no secret locked
           if (!player.secret) {
             io.to(player.socketId).emit('gameCanceled');
             resetGame(playerName, opponentName);
