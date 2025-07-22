@@ -1,6 +1,8 @@
+```javascript
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const fetch = require('node-fetch');
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -9,7 +11,7 @@ const io = new Server(server, {
   }
 });
 
-const players = {}; // playerName => { socketId, inGame, opponentName, secret, currentTurn, disconnected, timer }
+const players = {};
 
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
@@ -28,6 +30,10 @@ io.on('connection', (socket) => {
       }
       existing.socketId = socket.id;
       existing.disconnected = false;
+      existing.inGame = false; // Reset inGame on new registration
+      existing.opponentName = null;
+      existing.secret = null;
+      existing.currentTurn = false;
     } else {
       players[name] = {
         socketId: socket.id,
@@ -36,7 +42,9 @@ io.on('connection', (socket) => {
         secret: null,
         currentTurn: false,
         disconnected: false,
-        timer: null
+        timer: null,
+        wins: 0,
+        losses: 0
       };
     }
 
@@ -44,8 +52,32 @@ io.on('connection', (socket) => {
 
     io.to(socket.id).emit('nameRegistered');
     io.emit('updateLobby', getLobbySnapshot());
+    io.emit('leaderboardUpdate', getLeaderboard());
     console.log(`Player registered: ${name}, ID: ${socket.id}`);
     broadcastChat(`${name} has joined the lobby.`);
+  });
+
+  socket.on('rejoinLobby', () => {
+    const name = socket.data.playerName;
+    if (players[name]) {
+      players[name].socketId = socket.id;
+      players[name].inGame = false;
+      players[name].opponentName = null;
+      players[name].secret = null;
+      players[name].currentTurn = false;
+      players[name].disconnected = false;
+      if (players[name].timer) {
+        clearTimeout(players[name].timer);
+        players[name].timer = null;
+      }
+      console.log(`Player ${name} rejoined lobby with socket: ${socket.id}`);
+      io.emit('updateLobby', getLobbySnapshot());
+      io.emit('leaderboardUpdate', getLeaderboard());
+      broadcastChat(`${name} has returned to the lobby.`);
+    } else {
+      console.log(`Rejoin failed for ${name}: not found`);
+      io.to(socket.id).emit('forceDisconnect');
+    }
   });
 
   socket.on('challengePlayer', (targetName) => {
@@ -53,13 +85,13 @@ io.on('connection', (socket) => {
     const challenger = players[challengerName];
     const target = players[targetName];
 
-    if (!challenger || !target || challenger.inGame || target.inGame) {
-      console.log('Challenge failed: invalid challenger or target');
+    if (!challenger || !target || challenger.inGame || target.inGame || !target.socketId) {
+      console.log(`Challenge failed: invalid challenger (${challengerName}) or target (${targetName}, socket: ${target?.socketId})`);
       return;
     }
 
     io.to(target.socketId).emit('challengeReceived', challengerName);
-    console.log(`Challenge sent from ${challengerName} to ${targetName}`);
+    console.log(`Challenge sent from ${challengerName} to ${targetName} (socket: ${target.socketId})`);
   });
 
   socket.on('acceptChallenge', (challengerName) => {
@@ -78,6 +110,7 @@ io.on('connection', (socket) => {
     io.to(opponent.socketId).emit('redirectToMatch');
 
     io.emit('updateLobby', getLobbySnapshot());
+    io.emit('leaderboardUpdate', getLeaderboard());
 
     console.log(`Challenge accepted: ${challengerName} vs ${opponentName}`);
     broadcastChat(`${challengerName} and ${opponentName} are now in a game.`);
@@ -131,12 +164,15 @@ io.on('connection', (socket) => {
     io.to(opponent.socketId).emit('opponentGuess', { guess, bulls, cows });
 
     if (bulls === 4) {
+      players[name].wins += 1;
+      players[opponentName].losses += 1;
+      submitToLeaderboard(name, opponentName);
       io.to(player.socketId).emit('gameOver', 'win');
       io.to(opponent.socketId).emit('gameOver', 'lose');
       resetGame(name, player.opponentName);
       io.emit('updateLobby', getLobbySnapshot());
+      io.emit('leaderboardUpdate', getLeaderboard());
     } else {
-      // Switch turn
       player.currentTurn = false;
       opponent.currentTurn = true;
       io.to(opponent.socketId).emit('startGame', true);
@@ -148,15 +184,19 @@ io.on('connection', (socket) => {
     const player = players[name];
     if (!player || !player.currentTurn) return;
 
-    // Forfeit
     const opponentName = player.opponentName;
     const opponent = players[opponentName];
 
+    players[name].losses += 1;
+    if (opponent) players[opponentName].wins += 1;
+    submitToLeaderboard(name, opponentName);
+
     io.to(player.socketId).emit('gameOver', 'forfeit_lose');
-    io.to(opponent.socketId).emit('gameOver', 'forfeit_win');
+    if (opponent && opponent.socketId) io.to(opponent.socketId).emit('gameOver', 'forfeit_win');
 
     resetGame(name, opponentName);
     io.emit('updateLobby', getLobbySnapshot());
+    io.emit('leaderboardUpdate', getLeaderboard());
     console.log(`Player ${name} forfeited due to timeout vs ${opponentName}`);
   });
 
@@ -169,26 +209,43 @@ io.on('connection', (socket) => {
     const player = players[name];
     if (!player) return;
 
+    player.disconnected = true;
+    player.socketId = null;
+
     if (player.inGame) {
-      player.disconnected = true;
-      player.socketId = null;
+      const opponentName = player.opponentName;
+      const opponent = players[opponentName];
+
       player.timer = setTimeout(() => {
-        if (players[name] && players[name].disconnected) { // Check if still disconnected
-          const opponentName = player.opponentName;
-          const opponent = players[opponentName];
-          if (opponent && opponent.socketId) {
+        if (players[name] && players[name].disconnected) {
+          if (opponent && opponent.disconnected) {
+            // Both players disconnected: reset game and update leaderboard
+            players[name].losses += 1;
+            if (opponent) players[opponentName].wins += 1;
+            submitToLeaderboard(name, opponentName);
+            resetGame(name, opponentName);
+            console.log(`Game timed out for ${name} and ${opponentName} after 3 minutes inactivity`);
+            broadcastChat(`Game between ${name} and ${opponentName} timed out due to inactivity.`);
+            if (!opponent) delete players[name];
+          } else if (opponent && opponent.socketId) {
+            // One player disconnected: opponent wins
+            players[name].losses += 1;
+            players[opponentName].wins += 1;
+            submitToLeaderboard(name, opponentName);
             io.to(opponent.socketId).emit('gameOver', 'opponent_disconnected');
+            resetGame(name, opponentName);
+            console.log(`Cleanup timer fired for disconnected player: ${name}`);
+            broadcastChat(`${name} has left the lobby.`);
           }
-          resetGame(name, opponentName);
           delete players[name];
           io.emit('updateLobby', getLobbySnapshot());
-          console.log(`Cleanup timer fired for disconnected player: ${name}`);
-          broadcastChat(`${name} has left the lobby.`);
+          io.emit('leaderboardUpdate', getLeaderboard());
         }
-      }, 60000); // 60s
+      }, 180000); // 3 minutes
     } else {
       delete players[name];
       io.emit('updateLobby', getLobbySnapshot());
+      io.emit('leaderboardUpdate', getLeaderboard());
       broadcastChat(`${name} has left the lobby.`);
     }
   });
@@ -231,6 +288,60 @@ io.on('connection', (socket) => {
       name,
       inGame: data.inGame
     }));
+  }
+
+  function getLeaderboard() {
+    return Object.entries(players)
+      .map(([name, data]) => {
+        const totalGames = data.wins + data.losses;
+        const winPercentage = totalGames > 0 ? ((data.wins / totalGames) * 100).toFixed(1) : 0;
+        return { name, winPercentage, wins: data.wins, losses: data.losses, games: totalGames };
+      })
+      .filter(player => player.games > 0)
+      .sort((a, b) => b.winPercentage - a.winPercentage || b.games - a.games)
+      .slice(0, 10);
+  }
+
+  async function submitToLeaderboard(name, opponentName) {
+    const player = players[name];
+    const opponent = players[opponentName];
+    const submissions = [];
+
+    if (player && player.wins + player.losses > 0) {
+      const totalGames = player.wins + player.losses;
+      submissions.push({
+        name: name.slice(0, 10),
+        mode: 'versus',
+        avgAttempts: 0,
+        games: totalGames,
+        wins: player.wins
+      });
+    }
+
+    if (opponent && opponent.wins + opponent.losses > 0) {
+      const totalGames = opponent.wins + opponent.losses;
+      submissions.push({
+        name: opponentName.slice(0, 10),
+        mode: 'versus',
+        avgAttempts: 0,
+        games: totalGames,
+        wins: opponent.wins
+      });
+    }
+
+    for (const submission of submissions) {
+      try {
+        const response = await fetch('https://bullsandcowsgame.com/scripts/submit-leaderboard.php', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(submission)
+        });
+        const result = await response.json();
+        console.log(`Leaderboard submission for ${submission.name}:`, result);
+      } catch (error) {
+        console.error(`Error submitting leaderboard for ${submission.name}:`, error);
+      }
+    }
   }
 
   function getBullsAndCows(guess, secret) {
