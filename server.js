@@ -27,12 +27,12 @@ io.on('connection', (socket) => {
         clearTimeout(existing.timer);
         existing.timer = null;
       }
+      if (existing.startupTimer) {
+        clearTimeout(existing.startupTimer);
+        existing.startupTimer = null;
+      }
       existing.socketId = socket.id;
       existing.disconnected = false;
-      existing.inGame = false;
-      existing.opponentName = null;
-      existing.secret = null;
-      existing.currentTurn = false;
     } else {
       players[name] = {
         socketId: socket.id,
@@ -42,6 +42,7 @@ io.on('connection', (socket) => {
         currentTurn: false,
         disconnected: false,
         timer: null,
+        startupTimer: null,
         wins: 0,
         losses: 0
       };
@@ -68,6 +69,10 @@ io.on('connection', (socket) => {
       if (players[name].timer) {
         clearTimeout(players[name].timer);
         players[name].timer = null;
+      }
+      if (players[name].startupTimer) {
+        clearTimeout(players[name].startupTimer);
+        players[name].startupTimer = null;
       }
       console.log(`Player ${name} rejoined lobby with socket: ${socket.id}`);
       io.emit('updateLobby', getLobbySnapshot());
@@ -105,6 +110,10 @@ io.on('connection', (socket) => {
     challenger.opponentName = opponentName;
     opponent.opponentName = challengerName;
 
+    // Start startup grace period for both players
+    startStartupTimer(challengerName, opponentName);
+    startStartupTimer(opponentName, challengerName);
+
     io.to(challenger.socketId).emit('redirectToMatch');
     io.to(opponent.socketId).emit('redirectToMatch');
 
@@ -140,7 +149,6 @@ io.on('connection', (socket) => {
       players[firstTurn].currentTurn = true;
       if (players[firstTurn].socketId) {
         io.to(players[firstTurn].socketId).emit('startGame', true);
-        startTurnTimer(firstTurn, opponentName);
       }
       const other = firstTurn === name ? opponentName : name;
       if (players[other].socketId) {
@@ -156,9 +164,7 @@ io.on('connection', (socket) => {
     const player = players[name];
     if (!player || !player.currentTurn) return;
 
-    const opponentName = player.opponentName;
-    const opponent = players[opponentName];
-
+    const opponent = players[player.opponentName];
     if (!opponent || !opponent.secret) return;
 
     const { bulls, cows } = getBullsAndCows(guess, opponent.secret);
@@ -178,7 +184,6 @@ io.on('connection', (socket) => {
       player.currentTurn = false;
       opponent.currentTurn = true;
       io.to(opponent.socketId).emit('startGame', true);
-      startTurnTimer(opponentName, name); // Start timer for opponent
       io.to(player.socketId).emit('startGame', false);
     }
   });
@@ -359,48 +364,20 @@ io.on('connection', (socket) => {
     return { bulls, cows };
   }
 
-  function startTurnTimer(activePlayerName, passivePlayerName) {
-    const activePlayer = players[activePlayerName];
-    const passivePlayer = players[passivePlayerName];
-
-    if (!activePlayer || !passivePlayer) return;
-
-    let timeLeft = 180;
-    const timerInterval = setInterval(() => {
-      timeLeft--;
-      if (activePlayer.socketId) {
-        io.to(activePlayer.socketId).emit('timerUpdate', { timeLeft, isMyTurn: true });
-      }
-      if (passivePlayer.socketId) {
-        io.to(passivePlayer.socketId).emit('timerUpdate', { timeLeft, isMyTurn: false });
-      }
-      if (timeLeft <= 0) {
-        clearInterval(timerInterval);
-        socket.data.playerName = activePlayerName; // Temporarily set to active player for timerExpired
-        handleTimerExpired(activePlayerName);
-      }
-    }, 1000);
-    activePlayer.timer = timerInterval; // Store timer for cleanup if needed
-  }
-
-  function handleTimerExpired(name) {
-    const player = players[name];
-    if (!player || !player.currentTurn) return;
-
-    const opponentName = player.opponentName;
-    const opponent = players[opponentName];
-
-    players[name].losses += 1;
-    if (opponent) players[opponentName].wins += 1;
-    submitToLeaderboard(name, opponentName);
-
-    io.to(player.socketId).emit('gameOver', 'forfeit_lose');
-    if (opponent && opponent.socketId) io.to(opponent.socketId).emit('gameOver', 'forfeit_win');
-
-    resetGame(name, opponentName);
-    io.emit('updateLobby', getLobbySnapshot());
-    io.emit('leaderboardUpdate', getLeaderboard());
-    console.log(`Player ${name} forfeited due to timeout vs ${opponentName}`);
+  function startStartupTimer(playerName, opponentName) {
+    const player = players[playerName];
+    if (player) {
+      player.startupTimer = setTimeout(() => {
+        if (players[playerName]) {
+          console.log(`Startup grace period expired for ${playerName}`);
+          // Only cancel if no secret locked
+          if (!player.secret) {
+            io.to(player.socketId).emit('gameCanceled');
+            resetGame(playerName, opponentName);
+          }
+        }
+      }, 10000); // 10 seconds grace period
+    }
   }
 });
 
