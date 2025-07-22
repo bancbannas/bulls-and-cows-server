@@ -29,10 +29,6 @@ io.on('connection', (socket) => {
       }
       existing.socketId = socket.id;
       existing.disconnected = false;
-      existing.inGame = false;
-      existing.opponentName = null;
-      existing.secret = null;
-      existing.currentTurn = false;
     } else {
       players[name] = {
         socketId: socket.id,
