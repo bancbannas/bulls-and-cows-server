@@ -9,7 +9,7 @@ const io = new Server(server, {
   }
 });
 
-const players = {}; // playerName => { socketId, inGame, opponentName, secret, currentTurn, disconnected, timer, startupTimer }
+const players = {}; // playerName => { socketId, inGame, opponentName, secret, currentTurn, disconnected, timer }
 
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
@@ -26,10 +26,6 @@ io.on('connection', (socket) => {
         clearTimeout(existing.timer);
         existing.timer = null;
       }
-      if (existing.startupTimer) {
-        clearTimeout(existing.startupTimer);
-        existing.startupTimer = null;
-      }
       existing.socketId = socket.id;
       existing.disconnected = false;
     } else {
@@ -40,10 +36,7 @@ io.on('connection', (socket) => {
         secret: null,
         currentTurn: false,
         disconnected: false,
-        timer: null,
-        startupTimer: null,
-        wins: 0,
-        losses: 0
+        timer: null
       };
     }
 
@@ -81,10 +74,6 @@ io.on('connection', (socket) => {
     challenger.opponentName = opponentName;
     opponent.opponentName = challengerName;
 
-    // Start startup grace period for both players
-    startStartupTimer(challengerName);
-    startStartupTimer(opponentName);
-
     io.to(challenger.socketId).emit('redirectToMatch');
     io.to(opponent.socketId).emit('redirectToMatch');
 
@@ -114,12 +103,6 @@ io.on('connection', (socket) => {
     player.secret = secret;
     console.log(`Player ${name} locked secret: ${secret}`);
 
-    // Clear startup timer for this player
-    if (player.startupTimer) {
-      clearTimeout(player.startupTimer);
-      player.startupTimer = null;
-    }
-
     if (opponent.secret) {
       const firstTurn = Math.random() < 0.5 ? name : opponentName;
       players[firstTurn].currentTurn = true;
@@ -130,8 +113,7 @@ io.on('connection', (socket) => {
       if (players[other].socketId) {
         io.to(players[other].socketId).emit('startGame', false);
       }
-      startTurnTimer(firstTurn, other); // Start the timer for the first turn
-    } else if (opponent) {
+    } else if (!opponent.disconnected && opponent.socketId) {
       io.to(opponent.socketId).emit('opponentLocked');
     }
   });
@@ -158,9 +140,24 @@ io.on('connection', (socket) => {
       player.currentTurn = false;
       opponent.currentTurn = true;
       io.to(opponent.socketId).emit('startGame', true);
-      startTurnTimer(opponentName, name); // Start timer for opponent
-      io.to(player.socketId).emit('startGame', false);
     }
+  });
+
+  socket.on('timerExpired', () => {
+    const name = socket.data.playerName;
+    const player = players[name];
+    if (!player || !player.currentTurn) return;
+
+    // Forfeit
+    const opponentName = player.opponentName;
+    const opponent = players[opponentName];
+
+    io.to(player.socketId).emit('gameOver', 'forfeit_lose');
+    io.to(opponent.socketId).emit('gameOver', 'forfeit_win');
+
+    resetGame(name, opponentName);
+    io.emit('updateLobby', getLobbySnapshot());
+    console.log(`Player ${name} forfeited due to timeout vs ${opponentName}`);
   });
 
   socket.on('disconnect', () => {
@@ -172,84 +169,33 @@ io.on('connection', (socket) => {
     const player = players[name];
     if (!player) return;
 
-    player.disconnected = true;
-    player.socketId = null;
-
     if (player.inGame) {
-      const opponentName = player.opponentName;
-      const opponent = players[opponentName];
-
+      player.disconnected = true;
+      player.socketId = null;
       player.timer = setTimeout(() => {
-        if (players[name] && players[name].disconnected) {
-          if (opponent && opponent.disconnected) {
-            resetGame(name, opponentName);
-            console.log(`Game timed out for ${name} and ${opponentName} after 3 minutes inactivity`);
-            broadcastChat(`${name} and ${opponentName} 's game timed out due to inactivity.`);
-            if (!opponent) delete players[name];
-          } else if (opponent && opponent.socketId) {
+        if (players[name] && players[name].disconnected) { // Check if still disconnected
+          const opponentName = player.opponentName;
+          const opponent = players[opponentName];
+          if (opponent && opponent.socketId) {
             io.to(opponent.socketId).emit('gameOver', 'opponent_disconnected');
-            resetGame(name, opponentName);
-            console.log(`Cleanup timer fired for disconnected player: ${name}`);
-            broadcastChat(`${name} has left the lobby.`);
           }
+          resetGame(name, opponentName);
           delete players[name];
           io.emit('updateLobby', getLobbySnapshot());
+          console.log(`Cleanup timer fired for disconnected player: ${name}`);
+          broadcastChat(`${name} has left the lobby.`);
         }
-      }, 180000); // 3 minutes
+      }, 60000); // 60s
     } else {
       delete players[name];
       io.emit('updateLobby', getLobbySnapshot());
+      broadcastChat(`${name} has left the lobby.`);
     }
   });
 
-  function startStartupTimer(playerName) {
-    const player = players[playerName];
-    if (player) {
-      player.startupTimer = setTimeout(() => {
-        if (players[playerName] && !players[playerName].secret) {
-          console.log(`Startup grace period expired for ${playerName}`);
-          io.to(player.socketId).emit('gameCanceled');
-          resetGame(playerName, players[playerName].opponentName);
-        }
-      }, 10000); // 10 seconds
-    }
-  }
-
-  function startTurnTimer(activePlayerName) {
-    const player = players[activePlayerName];
-    const opponentName = player.opponentName;
-    const opponent = players[opponentName];
-
-    if (!player || !opponent) return;
-
-    let timeLeft = 180;
-    const timerInterval = setInterval(() => {
-      timeLeft--;
-      io.to(player.socketId).emit('timerUpdate', timeLeft);
-      io.to(opponent.socketId).emit('timerUpdate', timeLeft);
-      if (timeLeft <= 0) {
-        clearInterval(timerInterval);
-        socket.data.playerName = activePlayerName; // Temporarily set for timerExpired
-        handleTimerExpired(activePlayerName);
-      }
-    }, 1000);
-    player.timer = timerInterval;
-  }
-
-  function handleTimerExpired(name) {
-    const player = players[name];
-    if (!player || !player.currentTurn) return;
-
-    const opponentName = player.opponentName;
-    const opponent = players[opponentName];
-
-    io.to(player.socketId).emit('gameOver', 'forfeit_lose');
-    io.to(opponent.socketId).emit('gameOver', 'forfeit_win');
-
-    resetGame(name, opponentName);
-    io.emit('updateLobby', getLobbySnapshot());
-    console.log(`Player ${name} forfeited due to timeout vs ${opponentName}`);
-  }
+  socket.on('chatMessage', ({ name, message }) => {
+    broadcastChat(`${name}: ${message}`);
+  });
 
   function broadcastChat(message) {
     io.emit('chatMessage', { name: 'System', message });
@@ -258,12 +204,8 @@ io.on('connection', (socket) => {
   function resetGame(name1, name2) {
     if (players[name1]) {
       if (players[name1].timer) {
-        clearInterval(players[name1].timer);
+        clearTimeout(players[name1].timer);
         players[name1].timer = null;
-      }
-      if (players[name1].startupTimer) {
-        clearTimeout(players[name1].startupTimer);
-        players[name1].startupTimer = null;
       }
       players[name1].inGame = false;
       players[name1].opponentName = null;
@@ -273,12 +215,8 @@ io.on('connection', (socket) => {
     }
     if (players[name2]) {
       if (players[name2].timer) {
-        clearInterval(players[name2].timer);
+        clearTimeout(players[name2].timer);
         players[name2].timer = null;
-      }
-      if (players[name2].startupTimer) {
-        clearTimeout(players[name2].startupTimer);
-        players[name2].startupTimer = null;
       }
       players[name2].inGame = false;
       players[name2].opponentName = null;
