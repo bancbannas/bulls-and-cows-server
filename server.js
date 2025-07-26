@@ -1,6 +1,7 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -10,7 +11,7 @@ const io = new Server(server, {
 });
 
 const players = {}; // playerName => { socketId, inGame, opponentName, secret, currentTurn, disconnected, timer }
-const chatHistory = []; // Stores last 20 messages
+const chatHistory = [];
 
 function appendToChatHistory(name, message) {
   chatHistory.push({ name, message });
@@ -30,29 +31,21 @@ function getLobbySnapshot() {
 }
 
 function resetGame(name1, name2) {
-  if (players[name1]) {
-    if (players[name1].timer) clearTimeout(players[name1].timer);
-    players[name1].inGame = false;
-    players[name1].opponentName = null;
-    players[name1].secret = null;
-    players[name1].currentTurn = false;
-    players[name1].disconnected = false;
-    players[name1].timer = null;
-  }
-  if (players[name2]) {
-    if (players[name2].timer) clearTimeout(players[name2].timer);
-    players[name2].inGame = false;
-    players[name2].opponentName = null;
-    players[name2].secret = null;
-    players[name2].currentTurn = false;
-    players[name2].disconnected = false;
-    players[name2].timer = null;
-  }
+  [name1, name2].forEach(name => {
+    if (players[name]) {
+      if (players[name].timer) clearTimeout(players[name].timer);
+      players[name].inGame = false;
+      players[name].opponentName = null;
+      players[name].secret = null;
+      players[name].currentTurn = false;
+      players[name].disconnected = false;
+      players[name].timer = null;
+    }
+  });
 }
 
 function getBullsAndCows(guess, secret) {
-  let bulls = 0;
-  let cows = 0;
+  let bulls = 0, cows = 0;
   for (let i = 0; i < 4; i++) {
     if (guess[i] === secret[i]) {
       bulls++;
@@ -64,20 +57,15 @@ function getBullsAndCows(guess, secret) {
 }
 
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  console.log(`Connected: ${socket.id}`);
 
   socket.on('registerName', (name) => {
-    console.log(`Received registerName on socket: ${socket.id} Name: ${name}`);
-
     const existing = players[name];
     if (existing) {
       if (existing.socketId && existing.socketId !== socket.id) {
         io.to(existing.socketId).emit('forceDisconnect');
       }
-      if (existing.timer) {
-        clearTimeout(existing.timer);
-        existing.timer = null;
-      }
+      if (existing.timer) clearTimeout(existing.timer);
       existing.socketId = socket.id;
       existing.disconnected = false;
     } else {
@@ -103,32 +91,22 @@ io.on('connection', (socket) => {
     const challengerName = socket.data.playerName;
     const challenger = players[challengerName];
     const target = players[targetName];
-
-    if (!challenger || !target || challenger.inGame || target.inGame) {
-      console.log('Challenge failed: invalid challenger or target');
-      return;
-    }
-
+    if (!challenger || !target || challenger.inGame || target.inGame) return;
     io.to(target.socketId).emit('challengeReceived', challengerName);
     broadcastChat(`${challengerName} challenged ${targetName}`);
-    console.log(`Challenge sent from ${challengerName} to ${targetName}`);
   });
 
   socket.on('acceptChallenge', (challengerName) => {
     const opponentName = socket.data.playerName;
     const challenger = players[challengerName];
     const opponent = players[opponentName];
-
     if (!challenger || !opponent) return;
-
     challenger.inGame = true;
     opponent.inGame = true;
     challenger.opponentName = opponentName;
     opponent.opponentName = challengerName;
-
     io.to(challenger.socketId).emit('redirectToMatch');
     io.to(opponent.socketId).emit('redirectToMatch');
-
     io.emit('updateLobby', getLobbySnapshot());
     broadcastChat(`${challengerName} and ${opponentName} have started a match.`);
   });
@@ -137,33 +115,20 @@ io.on('connection', (socket) => {
     const name = socket.data.playerName;
     const player = players[name];
     if (!player) return;
-
     const opponentName = player.opponentName;
     const opponent = players[opponentName];
-
-    if (!opponentName || !opponent) {
-      if (player.socketId) {
-        io.to(player.socketId).emit('gameCanceled');
-      }
+    player.secret = secret;
+    if (!opponent || !opponentName) {
+      io.to(player.socketId).emit('gameCanceled');
       resetGame(name, opponentName);
-      console.log(`Game canceled for ${name}: opponent not found`);
       return;
     }
-
-    player.secret = secret;
-    console.log(`Player ${name} locked secret: ${secret}`);
-
     if (opponent.secret) {
       const firstTurn = Math.random() < 0.5 ? name : opponentName;
       players[firstTurn].currentTurn = true;
-      if (players[firstTurn].socketId) {
-        io.to(players[firstTurn].socketId).emit('startGame', true);
-      }
-      const other = firstTurn === name ? opponentName : name;
-      if (players[other].socketId) {
-        io.to(players[other].socketId).emit('startGame', false);
-      }
-    } else if (!opponent.disconnected && opponent.socketId) {
+      io.to(players[firstTurn].socketId).emit('startGame', true);
+      io.to(players[firstTurn === name ? opponentName : name].socketId).emit('startGame', false);
+    } else {
       io.to(opponent.socketId).emit('opponentLocked');
     }
   });
@@ -172,7 +137,6 @@ io.on('connection', (socket) => {
     const name = socket.data.playerName;
     const player = players[name];
     if (!player || !player.currentTurn) return;
-
     const opponent = players[player.opponentName];
     if (!opponent || !opponent.secret) return;
 
@@ -181,7 +145,8 @@ io.on('connection', (socket) => {
     io.to(opponent.socketId).emit('opponentGuess', { guess, bulls, cows });
 
     if (bulls === 4) {
-      broadcastChat(`${name} played ${player.opponentName}: ${name} won by guessing the code!`);
+      const winMsg = `${name} won the match against ${player.opponentName} with guess ${guess}`;
+      broadcastChat(winMsg);
       io.to(player.socketId).emit('gameOver', 'win');
       io.to(opponent.socketId).emit('gameOver', 'lose');
       resetGame(name, player.opponentName);
@@ -197,26 +162,20 @@ io.on('connection', (socket) => {
     const name = socket.data.playerName;
     const player = players[name];
     if (!player || !player.currentTurn) return;
-
-    const opponentName = player.opponentName;
-    const opponent = players[opponentName];
-
-    broadcastChat(`${name} played ${opponentName}: ${opponentName} won by forfeit (timeout).`);
-    io.to(player.socketId).emit('gameOver', 'forfeit_lose');
-    io.to(opponent.socketId).emit('gameOver', 'forfeit_win');
-
-    resetGame(name, opponentName);
-    io.emit('updateLobby', getLobbySnapshot());
-    console.log(`Player ${name} forfeited due to timeout vs ${opponentName}`);
+    const opponent = players[player.opponentName];
+    if (opponent && opponent.socketId) {
+      io.to(player.socketId).emit('gameOver', 'forfeit_lose');
+      io.to(opponent.socketId).emit('gameOver', 'forfeit_win');
+      broadcastChat(`${name} timed out. ${player.opponentName} wins by forfeit.`);
+      resetGame(name, player.opponentName);
+      io.emit('updateLobby', getLobbySnapshot());
+    }
   });
 
   socket.on('disconnect', () => {
     const name = socket.data.playerName;
-    console.log(`User disconnected: ${socket.id}`);
-    if (!name) return;
-
+    if (!name || !players[name]) return;
     const player = players[name];
-    if (!player) return;
 
     if (player.inGame) {
       player.disconnected = true;
@@ -227,7 +186,7 @@ io.on('connection', (socket) => {
           const opponent = players[opponentName];
           if (opponent && opponent.socketId) {
             io.to(opponent.socketId).emit('gameOver', 'opponent_disconnected');
-            broadcastChat(`${name} played ${opponentName}: ${opponentName} won by forfeit (disconnection).`);
+            broadcastChat(`${name} disconnected. ${opponentName} wins by default.`);
           }
           resetGame(name, opponentName);
           delete players[name];
