@@ -8,6 +8,7 @@ const io = new Server(server);
 
 let games = {}; // { room: { players: [], secrets: {}, guesses: {}, timers: {}, turn: 0, lastActivity: timestamp, reconnect: {} } }
 let chatHistory = []; // Stores last 20 chat messages globally
+let names = {}; // socket.id => player name
 
 function evaluate(guess, secret) {
   let bulls = 0, cows = 0;
@@ -40,6 +41,11 @@ function checkTimeouts() {
 setInterval(checkTimeouts, 10000);
 
 io.on('connection', socket => {
+  socket.on('registerName', name => {
+    names[socket.id] = name;
+    io.emit('lobbyUpdate', Object.entries(names).map(([id, name]) => ({ id, name })));
+  });
+
   socket.on('joinRoom', room => {
     socket.join(room);
     if (!games[room]) {
@@ -52,7 +58,9 @@ io.on('connection', socket => {
     socket.emit('chatHistory', chatHistory);
     if (games[room].players.length === 2) {
       games[room].players.forEach(id => io.to(id).emit('bothJoined'));
-      chatHistory.push({ text: `${games[room].players[0]} challenged ${games[room].players[1]}` });
+      const name1 = names[games[room].players[0]] || games[room].players[0];
+      const name2 = names[games[room].players[1]] || games[room].players[1];
+      chatHistory.push({ text: `${name1} challenged ${name2}` });
       if (chatHistory.length > 20) chatHistory.shift();
     }
   });
@@ -75,7 +83,9 @@ io.on('connection', socket => {
     io.to(opponent).emit('opponentGuess', { guess, ...result });
     if (result.bulls === 4) {
       io.to(room).emit('gameOver', { winner: socket.id });
-      chatHistory.push({ text: `${socket.id} won against ${opponent}` });
+      const winnerName = names[socket.id] || socket.id;
+      const loserName = names[opponent] || opponent;
+      chatHistory.push({ text: `${winnerName} won against ${loserName}` });
       if (chatHistory.length > 20) chatHistory.shift();
       setTimeout(() => io.to(room).emit('redirectLobby'), 15000);
       delete games[room];
@@ -91,13 +101,15 @@ io.on('connection', socket => {
         setTimeout(() => {
           if (games[room] && Date.now() - games[room].reconnect[socket.id] > 30000) {
             io.to(room).emit('playerLeft');
-            chatHistory.push({ text: `${socket.id} left the game.` });
+            chatHistory.push({ text: `${names[socket.id] || socket.id} left the game.` });
             if (chatHistory.length > 20) chatHistory.shift();
             delete games[room];
           }
         }, 30000);
       }
     }
+    delete names[socket.id];
+    io.emit('lobbyUpdate', Object.entries(names).map(([id, name]) => ({ id, name })));
   });
 });
 
