@@ -181,7 +181,7 @@ io.on('connection', (socket) => {
     io.to(opponent.socketId).emit('opponentGuess', { guess, bulls, cows });
 
     if (bulls === 4) {
-      broadcastChat(`${name} guessed ${guess} and won against ${player.opponentName}`);
+      broadcastChat(`${name} played ${player.opponentName}: ${name} won by guessing the code!`);
       io.to(player.socketId).emit('gameOver', 'win');
       io.to(opponent.socketId).emit('gameOver', 'lose');
       resetGame(name, player.opponentName);
@@ -201,7 +201,7 @@ io.on('connection', (socket) => {
     const opponentName = player.opponentName;
     const opponent = players[opponentName];
 
-    broadcastChat(`${name} timed out. ${opponentName} wins by forfeit.`);
+    broadcastChat(`${name} played ${opponentName}: ${opponentName} won by forfeit (timeout).`);
     io.to(player.socketId).emit('gameOver', 'forfeit_lose');
     io.to(opponent.socketId).emit('gameOver', 'forfeit_win');
 
@@ -227,7 +227,7 @@ io.on('connection', (socket) => {
           const opponent = players[opponentName];
           if (opponent && opponent.socketId) {
             io.to(opponent.socketId).emit('gameOver', 'opponent_disconnected');
-            broadcastChat(`${name} disconnected. ${opponentName} wins by default.`);
+            broadcastChat(`${name} played ${opponentName}: ${opponentName} won by forfeit (disconnection).`);
           }
           resetGame(name, opponentName);
           delete players[name];
