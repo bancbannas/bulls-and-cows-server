@@ -234,7 +234,7 @@ io.on('connection', (socket) => {
           io.emit('updateLobby', getLobbySnapshot());
           broadcastChat(`${name} has left the lobby.`);
         }
-      }, 60000);
+      }, 185000);
     } else {
       delete players[name];
       io.emit('updateLobby', getLobbySnapshot());
@@ -251,3 +251,4 @@ io.on('connection', (socket) => {
 server.listen(10000, () => {
   console.log('Server running on port 10000');
 });
+
