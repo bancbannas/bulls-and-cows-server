@@ -1,139 +1,216 @@
-// server.js
+// server.js — Bulls & Cows Versus (Render-hosted)
+// Adds iOS-resilient reconnect + authoritative state sync
+// Last updated: 2025-08-09
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: '*',
-  }
+  cors: { origin: '*' },
+  // Give iOS backgrounding more breathing room
+  pingTimeout: 70000,
+  pingInterval: 25000,
 });
 
-const players = {}; // playerName => { socketId, inGame, opponentName, secret, currentTurn, disconnected, timer, secretTimer }
-const chatHistory = []; // Stores last 20 messages
+// Data stores
+// players[name] = {
+//   name, socketId, deviceId,
+//   inGame, opponentName,
+//   secret, currentTurn,
+//   role: 'challenger'|'challenged'|null,
+//   disconnectTs: number|null,
+//   disconnectTimer: NodeJS.Timeout|null,
+// }
+const players = {};
+const chatHistory = []; // keep last 50 messages
 
-function appendToChatHistory(name, message) {
-  chatHistory.push({ name, message });
-  if (chatHistory.length > 20) chatHistory.shift();
+const MAX_CHAT = 50;
+const DISCONNECT_GRACE_MS = 30000; // 30s grace before forfeit
+
+function pushChat(name, message) {
+  chatHistory.push({ name, message, ts: Date.now() });
+  while (chatHistory.length > MAX_CHAT) chatHistory.shift();
 }
 
-function broadcastChat(message) {
-  appendToChatHistory('System', message);
-  io.emit('chatMessage', { name: 'System', message });
-}
-
-function getLobbySnapshot() {
-  return Object.entries(players).map(([name, data]) => ({
-    name,
-    inGame: data.inGame
+function lobbySnapshot() {
+  return Object.values(players).map(p => ({
+    name: p.name,
+    inGame: !!p.inGame,
+    opponent: p.opponentName || null,
   }));
 }
 
-function resetGame(name1, name2) {
-  if (players[name1]) {
-    if (players[name1].timer) clearTimeout(players[name1].timer);
-    if (players[name1].secretTimer) clearTimeout(players[name1].secretTimer);
-    players[name1].inGame = false;
-    players[name1].opponentName = null;
-    players[name1].secret = null;
-    players[name1].currentTurn = false;
-    players[name1].disconnected = false;
-    players[name1].timer = null;
-    players[name1].secretTimer = null;
+function broadcastLobby() {
+  io.emit('updateLobby', lobbySnapshot());
+}
+
+function opponentOf(name) {
+  const p = players[name];
+  if (!p || !p.opponentName) return null;
+  return players[p.opponentName] || null;
+}
+
+function resetPlayerState(name) {
+  const p = players[name];
+  if (!p) return;
+  p.inGame = false;
+  p.opponentName = null;
+  p.secret = null;
+  p.currentTurn = false;
+  p.role = null;
+}
+
+function endMatch(name, reason) {
+  // reason: 'win' | 'lose' | 'forfeit_win' | 'forfeit_lose' | 'opponent_disconnected'
+  const me = players[name];
+  if (!me) return;
+  const opp = opponentOf(name);
+
+  if (me.socketId) io.to(me.socketId).emit('gameOver', reason);
+
+  if (opp && opp.socketId) {
+    const oppReason =
+      reason === 'win' ? 'lose' :
+      reason === 'lose' ? 'win' :
+      reason === 'forfeit_win' ? 'forfeit_lose' :
+      reason === 'forfeit_lose' ? 'forfeit_win' :
+      // opponent_disconnected for me => I win
+      'win';
+    io.to(opp.socketId).emit('gameOver', oppReason);
   }
-  if (players[name2]) {
-    if (players[name2].timer) clearTimeout(players[name2].timer);
-    if (players[name2].secretTimer) clearTimeout(players[name2].secretTimer);
-    players[name2].inGame = false;
-    players[name2].opponentName = null;
-    players[name2].secret = null;
-    players[name2].currentTurn = false;
-    players[name2].disconnected = false;
-    players[name2].timer = null;
-    players[name2].secretTimer = null;
+
+  if (opp) { resetPlayerState(opp.name); }
+  resetPlayerState(name);
+  broadcastLobby();
+}
+
+function emitState(toSocketId, whoName) {
+  const me = players[whoName];
+  if (!me) return;
+  const opp = opponentOf(whoName);
+  const payload = {
+    inGame: !!me.inGame,
+    you: me.name,
+    opponent: opp ? opp.name : null,
+    yourTurn: !!me.currentTurn,
+    youLocked: !!me.secret,
+    opponentLocked: !!(opp && opp.secret),
+  };
+  io.to(toSocketId).emit('syncState', payload);
+}
+
+function startGameForPair(challengerName, opponentName) {
+  const a = players[challengerName];
+  const b = players[opponentName];
+  if (!a || !b) return;
+
+  // Roles
+  a.role = 'challenger';
+  b.role = 'challenged';
+
+  // Wait for both lockSecret
+  // First turn will be given to the challenged player by rule
+}
+
+function tryBeginTurns(name) {
+  // Called after any lockSecret; if both have secrets, start turn sequence
+  const me = players[name];
+  const opp = opponentOf(name);
+  if (!me || !opp) return;
+  if (me.secret && opp.secret) {
+    const first = me.role === 'challenged' ? me : (opp.role === 'challenged' ? opp : me);
+    const second = first.name === me.name ? opp : me;
+    first.currentTurn = true;
+    second.currentTurn = false;
+
+    if (first.socketId) io.to(first.socketId).emit('startGame', true);
+    if (second.socketId) io.to(second.socketId).emit('startGame', false);
+
+    // Sync both
+    if (first.socketId) emitState(first.socketId, first.name);
+    if (second.socketId) emitState(second.socketId, second.name);
   }
 }
 
-function getBullsAndCows(guess, secret) {
-  let bulls = 0;
-  let cows = 0;
-  for (let i = 0; i < 4; i++) {
-    if (guess[i] === secret[i]) {
-      bulls++;
-    } else if (secret.includes(guess[i])) {
-      cows++;
-    }
-  }
-  const poops = 4 - bulls - cows;
-  return { bulls, cows, poops };
+function bullsAndCows(guess, secret) {
+  let bulls = 0, cows = 0;
+  for (let i = 0; i < 4; i++) if (guess[i] === secret[i]) bulls++;
+  for (let g of guess) if (secret.includes(g)) cows++;
+  cows -= bulls;
+  return { bulls, cows };
 }
 
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  // --- Registration ---
+  socket.on('registerName', (name, deviceId) => {
+    if (!name || typeof name !== 'string') return;
+    name = name.trim();
 
-  socket.on('registerName', (name) => {
-    console.log(`Received registerName on socket: ${socket.id} Name: ${name}`);
-
+    // If someone with same name exists, decide if it's a legit handover
     const existing = players[name];
     if (existing) {
-      if (existing.socketId && existing.socketId !== socket.id) {
-        io.to(existing.socketId).emit('forceDisconnect');
+      // If deviceId differs, kick old socket (assume real user reclaiming name)
+      if (deviceId && existing.deviceId && deviceId !== existing.deviceId) {
+        if (existing.socketId) io.to(existing.socketId).emit('forceDisconnect');
       }
-      if (existing.timer) {
-        clearTimeout(existing.timer);
-        existing.timer = null;
-      }
-      if (existing.secretTimer) {
-        clearTimeout(existing.secretTimer);
-      }
-      existing.socketId = socket.id;
-      existing.disconnected = false;
+      // Rebind this connection to the name
+      players[name] = {
+        ...existing,
+        name,
+        socketId: socket.id,
+        deviceId: deviceId || existing.deviceId || null,
+        disconnectTs: null,
+      };
     } else {
       players[name] = {
+        name,
         socketId: socket.id,
+        deviceId: deviceId || null,
         inGame: false,
         opponentName: null,
         secret: null,
         currentTurn: false,
-        disconnected: false,
-        timer: null,
-        secretTimer: null
+        role: null,
+        disconnectTs: null,
+        disconnectTimer: null,
       };
     }
 
     socket.data.playerName = name;
-    io.to(socket.id).emit('nameRegistered');
-    io.to(socket.id).emit('chatHistory', chatHistory);
-    io.emit('updateLobby', getLobbySnapshot());
-    broadcastChat(`${name} has joined the lobby.`);
 
-    // If in a match and secret not yet locked, start/resume secret phase
-    if (players[name] && players[name].inGame && !players[name].secret) {
-      io.to(socket.id).emit('enterSecretPhase');
+    socket.emit('nameRegistered');
+    socket.emit('chatHistory', chatHistory);
+    broadcastLobby();
+
+    // If this player was already mid-match, push them back and sync
+    const me = players[name];
+    if (me && me.inGame) {
+      socket.emit('redirectToMatch');
+      emitState(socket.id, name);
     }
   });
 
-  socket.on('challengePlayer', (targetName) => {
-    const challengerName = socket.data.playerName;
-    const challenger = players[challengerName];
-    const target = players[targetName];
-
-    if (!challenger || !target || challenger.inGame || target.inGame) {
-      console.log('Challenge failed: invalid challenger or target');
-      return;
-    }
-
-    io.to(target.socketId).emit('challengeReceived', challengerName);
-    broadcastChat(`${challengerName} challenged ${targetName}`);
-    console.log(`Challenge sent from ${challengerName} to ${targetName}`);
-  });
-
-  socket.on('acceptChallenge', (challengerName) => {
-    const opponentName = socket.data.playerName;
+  // --- Lobby: challenge flow ---
+  socket.on('challengePlayer', ({ challengerName, opponentName }) => {
     const challenger = players[challengerName];
     const opponent = players[opponentName];
+    if (!challenger || !opponent) return;
+    if (challenger.inGame || opponent.inGame) return;
 
+    if (opponent.socketId) io.to(opponent.socketId).emit('incomingChallenge', { from: challengerName });
+  });
+
+  socket.on('declineChallenge', ({ opponentName, challengerName }) => {
+    const ch = players[challengerName];
+    if (ch && ch.socketId) io.to(ch.socketId).emit('challengeDeclined', { by: opponentName });
+  });
+
+  socket.on('acceptChallenge', ({ challengerName, opponentName }) => {
+    const challenger = players[challengerName];
+    const opponent = players[opponentName];
     if (!challenger || !opponent) return;
 
     challenger.inGame = true;
@@ -141,156 +218,133 @@ io.on('connection', (socket) => {
     challenger.opponentName = opponentName;
     opponent.opponentName = challengerName;
 
-    // Start secret timers for both
-    challenger.secretTimer = setTimeout(() => {
-      if (players[challengerName] && !players[challengerName].secret) {
-        const player = players[challengerName];
-        const oppName = player.opponentName;
-        const opp = players[oppName];
-        broadcastChat(`${challengerName} timed out on secret entry. ${oppName} wins by forfeit.`);
-        if (player.socketId) io.to(player.socketId).emit('gameOver', 'secret_timeout_lose');
-        if (opp && opp.socketId) io.to(opp.socketId).emit('gameOver', 'secret_timeout_win');
-        resetGame(challengerName, oppName);
-        io.emit('updateLobby', getLobbySnapshot());
-      }
-    }, 180000); // 180 seconds
+    startGameForPair(challengerName, opponentName);
 
-    opponent.secretTimer = setTimeout(() => {
-      if (players[opponentName] && !players[opponentName].secret) {
-        const player = players[opponentName];
-        const oppName = player.opponentName;
-        const opp = players[oppName];
-        broadcastChat(`${opponentName} timed out on secret entry. ${oppName} wins by forfeit.`);
-        if (player.socketId) io.to(player.socketId).emit('gameOver', 'secret_timeout_lose');
-        if (opp && opp.socketId) io.to(opp.socketId).emit('gameOver', 'secret_timeout_win');
-        resetGame(opponentName, oppName);
-        io.emit('updateLobby', getLobbySnapshot());
-      }
-    }, 180000); // 180 seconds
+    if (challenger.socketId) io.to(challenger.socketId).emit('redirectToMatch');
+    if (opponent.socketId) io.to(opponent.socketId).emit('redirectToMatch');
 
-    io.to(challenger.socketId).emit('redirectToMatch');
-    io.to(opponent.socketId).emit('redirectToMatch');
-
-    io.emit('updateLobby', getLobbySnapshot());
-    broadcastChat(`${challengerName} and ${opponentName} have started a match.`);
+    broadcastLobby();
+    pushChat('SYSTEM', `${challengerName} and ${opponentName} started a match.`);
   });
 
+  // --- Secret lock-in ---
   socket.on('lockSecret', (secret) => {
     const name = socket.data.playerName;
-    const player = players[name];
-    if (!player) return;
+    const me = players[name];
+    if (!me) return;
 
-    const opponentName = player.opponentName;
-    const opponent = players[opponentName];
-
-    if (!opponentName || !opponent) {
-      if (player.socketId) {
-        io.to(player.socketId).emit('gameCanceled');
-      }
-      resetGame(name, opponentName);
-      console.log(`Game canceled for ${name}: opponent not found`);
+    const opp = opponentOf(name);
+    if (!opp) {
+      if (me.socketId) io.to(me.socketId).emit('gameCanceled');
+      resetPlayerState(name);
+      broadcastLobby();
       return;
     }
 
-    if (player.secretTimer) clearTimeout(player.secretTimer);
-    player.secret = secret;
-    console.log(`Player ${name} locked secret: ${secret}`);
+    // Validate secret: 4 unique digits
+    if (!/^\d{4}$/.test(secret) || new Set(secret.split('')).size !== 4) return;
 
-    if (opponent.secret) {
-      const firstTurn = Math.random() < 0.5 ? name : opponentName;
-      players[firstTurn].currentTurn = true;
-      if (players[firstTurn].socketId) {
-        io.to(players[firstTurn].socketId).emit('startGame', true);
-      }
-      const other = firstTurn === name ? opponentName : name;
-      if (players[other].socketId) {
-        io.to(players[other].socketId).emit('startGame', false);
-      }
-    } else if (!opponent.disconnected && opponent.socketId) {
-      io.to(opponent.socketId).emit('opponentLocked');
-    }
+    me.secret = secret;
+    if (opp.socketId) io.to(opp.socketId).emit('opponentLocked');
+
+    tryBeginTurns(name);
   });
 
+  // --- Turn submission ---
   socket.on('submitGuess', (guess) => {
     const name = socket.data.playerName;
-    const player = players[name];
-    if (!player || !player.currentTurn) return;
+    const me = players[name];
+    const opp = opponentOf(name);
+    if (!me || !opp) return;
+    if (!me.currentTurn) return; // not your turn
 
-    const opponent = players[player.opponentName];
-    if (!opponent || !opponent.secret) return;
+    // Validate guess: 4 unique digits
+    if (!/^\d{4}$/.test(guess) || new Set(guess.split('')).size !== 4) return;
 
-    const { bulls, cows, poops } = getBullsAndCows(guess, opponent.secret);
-    io.to(player.socketId).emit('guessResult', { guess, bulls, cows, poops });
-    io.to(opponent.socketId).emit('opponentGuess', { guess, bulls, cows, poops });
+    const { bulls, cows } = bullsAndCows(guess, opp.secret);
+
+    if (me.socketId) io.to(me.socketId).emit('guessResult', { guess, bulls, cows });
+    if (opp.socketId) io.to(opp.socketId).emit('opponentGuess', { guess, bulls, cows });
 
     if (bulls === 4) {
-      broadcastChat(`${name} guessed ${guess} and won against ${player.opponentName}`);
-      io.to(player.socketId).emit('gameOver', 'win');
-      io.to(opponent.socketId).emit('gameOver', 'lose');
-      resetGame(name, player.opponentName);
-      io.emit('updateLobby', getLobbySnapshot());
-    } else {
-      player.currentTurn = false;
-      opponent.currentTurn = true;
-      io.to(opponent.socketId).emit('startGame', true);
+      endMatch(name, 'win');
+      return;
     }
+
+    // Toggle turns
+    me.currentTurn = false;
+    opp.currentTurn = true;
+
+    if (opp.socketId) io.to(opp.socketId).emit('startGame', true);
+    if (me.socketId) io.to(me.socketId).emit('startGame', false);
+
+    // Sync both after every turn
+    if (me.socketId) emitState(me.socketId, me.name);
+    if (opp.socketId) emitState(opp.socketId, opp.name);
   });
 
+  // --- Timer expiry (client tells server) ---
   socket.on('timerExpired', () => {
     const name = socket.data.playerName;
-    const player = players[name];
-    if (!player || !player.currentTurn) return;
+    const me = players[name];
+    if (!me) return;
+    const opp = opponentOf(name);
+    if (!opp) return;
 
-    const opponentName = player.opponentName;
-    const opponent = players[opponentName];
-
-    broadcastChat(`${name} timed out. ${opponentName} wins by forfeit.`);
-    io.to(player.socketId).emit('gameOver', 'forfeit_lose');
-    io.to(opponent.socketId).emit('gameOver', 'forfeit_win');
-
-    resetGame(name, opponentName);
-    io.emit('updateLobby', getLobbySnapshot());
-    console.log(`Player ${name} forfeited due to timeout vs ${opponentName}`);
-  });
-
-  socket.on('disconnect', () => {
-    const name = socket.data.playerName;
-    console.log(`User disconnected: ${socket.id}`);
-    if (!name) return;
-
-    const player = players[name];
-    if (!player) return;
-
-    if (player.inGame) {
-      player.disconnected = true;
-      player.socketId = null;
-      player.timer = setTimeout(() => {
-        if (players[name] && players[name].disconnected) {
-          const opponentName = player.opponentName;
-          const opponent = players[opponentName];
-          if (opponent && opponent.socketId) {
-            io.to(opponent.socketId).emit('gameOver', 'opponent_disconnected');
-            broadcastChat(`${name} disconnected. ${opponentName} wins by default.`);
-          }
-          resetGame(name, opponentName);
-          delete players[name];
-          io.emit('updateLobby', getLobbySnapshot());
-          broadcastChat(`${name} has left the lobby.`);
-        }
-      }, 185000); // 3 minutes and 5 seconds (185 seconds)
-    } else {
-      delete players[name];
-      io.emit('updateLobby', getLobbySnapshot());
-      broadcastChat(`${name} has left the lobby.`);
+    // Only forfeit if it was actually your turn
+    if (me.currentTurn) {
+      endMatch(name, 'forfeit_lose');
     }
   });
 
+  // --- State sync on demand ---
+  socket.on('requestState', () => {
+    const name = socket.data.playerName;
+    if (name && players[name]) emitState(socket.id, name);
+  });
+
+  // --- Chat ---
   socket.on('chatMessage', ({ name, message }) => {
-    appendToChatHistory(name, message);
+    if (!message || typeof message !== 'string') return;
+    pushChat(name || 'anon', message.trim());
     io.emit('chatMessage', { name, message });
+  });
+
+  // --- Disconnect handling with grace ---
+  socket.on('disconnect', () => {
+    const name = socket.data.playerName;
+    const me = players[name];
+    if (!name || !me) return;
+
+    // mark disconnect time
+    me.disconnectTs = Date.now();
+
+    // If in lobby only, remove immediately
+    if (!me.inGame) {
+      delete players[name];
+      broadcastLobby();
+      return;
+    }
+
+    // In a game: start grace timer; if not back, opponent wins
+    if (me.disconnectTimer) clearTimeout(me.disconnectTimer);
+    me.disconnectTimer = setTimeout(() => {
+      // If still disconnected or not rebound, forfeit
+      const still = players[name];
+      if (!still) return; // already cleaned
+      const reconnected = still.socketId && still.disconnectTs === null;
+      if (!reconnected) {
+        endMatch(name, 'opponent_disconnected'); // from their POV, they win
+        // Also clean up records
+        const opp = opponentOf(name);
+        if (opp) resetPlayerState(opp.name);
+        resetPlayerState(name);
+        broadcastLobby();
+      }
+    }, DISCONNECT_GRACE_MS);
   });
 });
 
-server.listen(10000, () => {
-  console.log('Server running on port 10000');
+server.listen(process.env.PORT || 10000, () => {
+  console.log('Server running on port', process.env.PORT || 10000);
 });
