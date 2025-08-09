@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -9,7 +10,7 @@ const io = new Server(server, {
   }
 });
 
-const players = {}; // playerName => { socketId, inGame, opponentName, secret, currentTurn, disconnected, timer }
+const players = {}; // playerName => { socketId, inGame, opponentName, secret, currentTurn, disconnected, timer, secretTimer }
 const chatHistory = []; // Stores last 20 messages
 
 function appendToChatHistory(name, message) {
@@ -32,21 +33,25 @@ function getLobbySnapshot() {
 function resetGame(name1, name2) {
   if (players[name1]) {
     if (players[name1].timer) clearTimeout(players[name1].timer);
+    if (players[name1].secretTimer) clearTimeout(players[name1].secretTimer);
     players[name1].inGame = false;
     players[name1].opponentName = null;
     players[name1].secret = null;
     players[name1].currentTurn = false;
     players[name1].disconnected = false;
     players[name1].timer = null;
+    players[name1].secretTimer = null;
   }
   if (players[name2]) {
     if (players[name2].timer) clearTimeout(players[name2].timer);
+    if (players[name2].secretTimer) clearTimeout(players[name2].secretTimer);
     players[name2].inGame = false;
     players[name2].opponentName = null;
     players[name2].secret = null;
     players[name2].currentTurn = false;
     players[name2].disconnected = false;
     players[name2].timer = null;
+    players[name2].secretTimer = null;
   }
 }
 
@@ -60,7 +65,8 @@ function getBullsAndCows(guess, secret) {
       cows++;
     }
   }
-  return { bulls, cows };
+  const poops = 4 - bulls - cows;
+  return { bulls, cows, poops };
 }
 
 io.on('connection', (socket) => {
@@ -78,6 +84,9 @@ io.on('connection', (socket) => {
         clearTimeout(existing.timer);
         existing.timer = null;
       }
+      if (existing.secretTimer) {
+        clearTimeout(existing.secretTimer);
+      }
       existing.socketId = socket.id;
       existing.disconnected = false;
     } else {
@@ -88,7 +97,8 @@ io.on('connection', (socket) => {
         secret: null,
         currentTurn: false,
         disconnected: false,
-        timer: null
+        timer: null,
+        secretTimer: null
       };
     }
 
@@ -97,6 +107,11 @@ io.on('connection', (socket) => {
     io.to(socket.id).emit('chatHistory', chatHistory);
     io.emit('updateLobby', getLobbySnapshot());
     broadcastChat(`${name} has joined the lobby.`);
+
+    // If in a match and secret not yet locked, start/resume secret phase
+    if (players[name] && players[name].inGame && !players[name].secret) {
+      io.to(socket.id).emit('enterSecretPhase');
+    }
   });
 
   socket.on('challengePlayer', (targetName) => {
@@ -126,6 +141,33 @@ io.on('connection', (socket) => {
     challenger.opponentName = opponentName;
     opponent.opponentName = challengerName;
 
+    // Start secret timers for both
+    challenger.secretTimer = setTimeout(() => {
+      if (players[challengerName] && !players[challengerName].secret) {
+        const player = players[challengerName];
+        const oppName = player.opponentName;
+        const opp = players[oppName];
+        broadcastChat(`${challengerName} timed out on secret entry. ${oppName} wins by forfeit.`);
+        if (player.socketId) io.to(player.socketId).emit('gameOver', 'secret_timeout_lose');
+        if (opp && opp.socketId) io.to(opp.socketId).emit('gameOver', 'secret_timeout_win');
+        resetGame(challengerName, oppName);
+        io.emit('updateLobby', getLobbySnapshot());
+      }
+    }, 180000); // 180 seconds
+
+    opponent.secretTimer = setTimeout(() => {
+      if (players[opponentName] && !players[opponentName].secret) {
+        const player = players[opponentName];
+        const oppName = player.opponentName;
+        const opp = players[oppName];
+        broadcastChat(`${opponentName} timed out on secret entry. ${oppName} wins by forfeit.`);
+        if (player.socketId) io.to(player.socketId).emit('gameOver', 'secret_timeout_lose');
+        if (opp && opp.socketId) io.to(opp.socketId).emit('gameOver', 'secret_timeout_win');
+        resetGame(opponentName, oppName);
+        io.emit('updateLobby', getLobbySnapshot());
+      }
+    }, 180000); // 180 seconds
+
     io.to(challenger.socketId).emit('redirectToMatch');
     io.to(opponent.socketId).emit('redirectToMatch');
 
@@ -150,6 +192,7 @@ io.on('connection', (socket) => {
       return;
     }
 
+    if (player.secretTimer) clearTimeout(player.secretTimer);
     player.secret = secret;
     console.log(`Player ${name} locked secret: ${secret}`);
 
@@ -176,9 +219,9 @@ io.on('connection', (socket) => {
     const opponent = players[player.opponentName];
     if (!opponent || !opponent.secret) return;
 
-    const { bulls, cows } = getBullsAndCows(guess, opponent.secret);
-    io.to(player.socketId).emit('guessResult', { guess, bulls, cows });
-    io.to(opponent.socketId).emit('opponentGuess', { guess, bulls, cows });
+    const { bulls, cows, poops } = getBullsAndCows(guess, opponent.secret);
+    io.to(player.socketId).emit('guessResult', { guess, bulls, cows, poops });
+    io.to(opponent.socketId).emit('opponentGuess', { guess, bulls, cows, poops });
 
     if (bulls === 4) {
       broadcastChat(`${name} guessed ${guess} and won against ${player.opponentName}`);
@@ -234,7 +277,7 @@ io.on('connection', (socket) => {
           io.emit('updateLobby', getLobbySnapshot());
           broadcastChat(`${name} has left the lobby.`);
         }
-      }, 185000);
+      }, 185000); // 3 minutes and 5 seconds (185 seconds)
     } else {
       delete players[name];
       io.emit('updateLobby', getLobbySnapshot());
@@ -251,4 +294,3 @@ io.on('connection', (socket) => {
 server.listen(10000, () => {
   console.log('Server running on port 10000');
 });
-
