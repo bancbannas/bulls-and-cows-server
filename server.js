@@ -1,7 +1,8 @@
 // server.js — Bulls & Cows Versus (Render-hosted)
 // iOS-resilient reconnect + authoritative state sync
 // + lobby history feed + visible lock/turn timers
-// Last updated: 2025-08-09
+// + server-driven post-game return countdown
+// Last updated: 2025-08-11
 
 const express = require('express');
 const http = require('http');
@@ -11,12 +12,12 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*' },
-  // Give iOS backgrounding more breathing room
+  // Help iOS when app backgrounds
   pingTimeout: 70000,
   pingInterval: 25000,
 });
 
-// Data stores
+// ===== Data stores =====
 // players[name] = {
 //   name, socketId, deviceId,
 //   inGame, opponentName,
@@ -26,10 +27,11 @@ const io = new Server(server, {
 //   disconnectTimer: NodeJS.Timeout|null,
 // }
 const players = {};
-const chatHistory = []; // keep last 200 messages
-
+const chatHistory = []; // last 200 messages
 const MAX_CHAT = 200;
-const DISCONNECT_GRACE_MS = 30000; // 30s grace before forfeit
+
+const DISCONNECT_GRACE_MS = 30000; // 30s grace before awarding win on disconnect
+const RETURN_TO_LOBBY_SECONDS = 10; // server-driven countdown duration
 
 function pushChat(name, message) {
   chatHistory.push({ name, message, ts: Date.now() });
@@ -65,35 +67,6 @@ function resetPlayerState(name) {
   p.role = null;
 }
 
-function endMatch(name, reason) {
-  // reason: 'win' | 'lose' | 'forfeit_win' | 'forfeit_lose' | 'opponent_disconnected'
-  const me = players[name];
-  if (!me) return;
-  const opp = opponentOf(name);
-
-  if (me.socketId) io.to(me.socketId).emit('gameOver', reason);
-
-  if (opp && opp.socketId) {
-    const oppReason =
-      reason === 'win' ? 'lose' :
-      reason === 'lose' ? 'win' :
-      reason === 'forfeit_win' ? 'forfeit_lose' :
-      reason === 'forfeit_lose' ? 'forfeit_win' :
-      // opponent_disconnected (from 'name' POV) means other side wins
-      'win';
-    io.to(opp.socketId).emit('gameOver', oppReason);
-  }
-
-  // Announce result to lobby chat
-  const winner = (reason === 'win' || reason === 'forfeit_win' || reason === 'opponent_disconnected') ? me.name : (opp ? opp.name : '');
-  const loser = (winner === me?.name) ? (opp?.name || '') : me?.name;
-  if (winner && loser) pushChat('SYSTEM', `Match result: ${winner} defeated ${loser}${String(reason).includes('forfeit') ? ' (forfeit)' : ''}.`);
-
-  if (opp) { resetPlayerState(opp.name); }
-  resetPlayerState(name);
-  broadcastLobby();
-}
-
 function emitState(toSocketId, whoName) {
   const me = players[whoName];
   if (!me) return;
@@ -113,7 +86,6 @@ function startGameForPair(challengerName, opponentName) {
   const a = players[challengerName];
   const b = players[opponentName];
   if (!a || !b) return;
-
   a.role = 'challenger';
   b.role = 'challenged';
 }
@@ -144,17 +116,55 @@ function bullsAndCows(guess, secret) {
   return { bulls, cows };
 }
 
+function endMatch(name, reason) {
+  // reason: 'win' | 'lose' | 'forfeit_win' | 'forfeit_lose' | 'opponent_disconnected'
+  const me = players[name];
+  if (!me) return;
+  const opp = opponentOf(name);
+
+  // Notify both sides of result
+  if (me.socketId) io.to(me.socketId).emit('gameOver', reason);
+  if (opp && opp.socketId) {
+    const oppReason =
+      reason === 'win' ? 'lose' :
+      reason === 'lose' ? 'win' :
+      reason === 'forfeit_win' ? 'forfeit_lose' :
+      reason === 'forfeit_lose' ? 'forfeit_win' :
+      // 'opponent_disconnected' from name's POV → opponent sees win
+      'win';
+    io.to(opp.socketId).emit('gameOver', oppReason);
+  }
+
+  // NEW: tell both sides when to return to lobby (visible countdown on client)
+  if (me.socketId) io.to(me.socketId).emit('returnToLobbyIn', RETURN_TO_LOBBY_SECONDS);
+  if (opp && opp.socketId) io.to(opp.socketId).emit('returnToLobbyIn', RETURN_TO_LOBBY_SECONDS);
+
+  // Publish result to lobby chat
+  const winner = (reason === 'win' || reason === 'forfeit_win' || reason === 'opponent_disconnected') ? me.name : (opp ? opp.name : '');
+  const loser = (winner === me?.name) ? (opp?.name || '') : me?.name;
+  if (winner && loser) {
+    const forfeited = String(reason).includes('forfeit') ? ' (forfeit)' : '';
+    pushChat('SYSTEM', `Match result: ${winner} defeated ${loser}${forfeited}.`);
+  }
+
+  // Reset states
+  if (opp) resetPlayerState(opp.name);
+  resetPlayerState(name);
+  broadcastLobby();
+}
+
+// ===== Socket handlers =====
 io.on('connection', (socket) => {
-  // --- Registration ---
+  // Registration
   socket.on('registerName', (name, deviceId) => {
     if (!name || typeof name !== 'string') return;
     name = name.trim();
 
-    const hadPlayer = !!players[name];
-
-    // If someone with same name exists, decide if it's a legit handover
     const existing = players[name];
+    const hadPlayer = !!existing;
+
     if (existing) {
+      // Hand-over if same user on different socket/device
       if (deviceId && existing.deviceId && deviceId !== existing.deviceId) {
         if (existing.socketId) io.to(existing.socketId).emit('forceDisconnect');
       }
@@ -188,6 +198,7 @@ io.on('connection', (socket) => {
 
     if (!hadPlayer) pushChat('SYSTEM', `${name} connected`);
 
+    // If player was mid-game, send them to match and sync
     const me = players[name];
     if (me && me.inGame) {
       socket.emit('redirectToMatch');
@@ -195,7 +206,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- Lobby: challenge flow ---
+  // Lobby: challenge flow
   socket.on('challengePlayer', ({ challengerName, opponentName }) => {
     const challenger = players[challengerName];
     const opponent = players[opponentName];
@@ -233,7 +244,7 @@ io.on('connection', (socket) => {
     broadcastLobby();
   });
 
-  // --- Secret lock-in ---
+  // Secret lock-in
   socket.on('lockSecret', (secret) => {
     const name = socket.data.playerName;
     const me = players[name];
@@ -241,7 +252,11 @@ io.on('connection', (socket) => {
 
     const opp = opponentOf(name);
     if (!opp) {
-      if (me.socketId) io.to(me.socketId).emit('gameCanceled');
+      // Opponent vanished before game start
+      if (me.socketId) {
+        io.to(me.socketId).emit('gameCanceled');
+        io.to(me.socketId).emit('returnToLobbyIn', RETURN_TO_LOBBY_SECONDS); // NEW: countdown
+      }
       resetPlayerState(name);
       broadcastLobby();
       return;
@@ -257,7 +272,7 @@ io.on('connection', (socket) => {
     tryBeginTurns(name);
   });
 
-  // --- Turn submission ---
+  // Turn submission
   socket.on('submitGuess', (guess) => {
     const name = socket.data.playerName;
     const me = players[name];
@@ -287,7 +302,7 @@ io.on('connection', (socket) => {
     emitState(opp.socketId, opp.name);
   });
 
-  // --- Timer expiry (turn) ---
+  // Timer expiry (turn)
   socket.on('timerExpired', () => {
     const name = socket.data.playerName;
     const me = players[name];
@@ -301,7 +316,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- Timer expiry (lock-in phase) ---
+  // Timer expiry (lock-in phase)
   socket.on('lockTimerExpired', () => {
     const name = socket.data.playerName;
     const me = players[name];
@@ -315,19 +330,19 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- State sync on demand ---
+  // State sync on demand
   socket.on('requestState', () => {
     const name = socket.data.playerName;
     if (name && players[name]) emitState(socket.id, name);
   });
 
-  // --- Chat (user messages) ---
+  // Lobby chat
   socket.on('chatMessage', ({ name, message }) => {
     if (!message || typeof message !== 'string') return;
     pushChat(name || 'anon', message.trim());
   });
 
-  // --- Disconnect handling with grace ---
+  // Disconnect with grace
   socket.on('disconnect', () => {
     const name = socket.data.playerName;
     const me = players[name];
