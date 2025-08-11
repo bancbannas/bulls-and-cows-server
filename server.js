@@ -31,7 +31,7 @@ const chatHistory = []; // last 200 messages
 const MAX_CHAT = 200;
 
 const DISCONNECT_GRACE_MS = 30000; // 30s grace before awarding win on disconnect
-const RETURN_TO_LOBBY_SECONDS = 1000; // server-driven countdown duration
+const RETURN_TO_LOBBY_SECONDS = 10; // server-driven countdown duration
 
 function pushChat(name, message) {
   chatHistory.push({ name, message, ts: Date.now() });
@@ -377,4 +377,5 @@ io.on('connection', (socket) => {
 server.listen(process.env.PORT || 10000, () => {
   console.log('Server running on port', process.env.PORT || 10000);
 });
+
 
