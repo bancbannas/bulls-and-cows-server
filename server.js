@@ -2,6 +2,7 @@
 // iOS-resilient reconnect + authoritative state sync
 // + lobby history feed + visible lock/turn timers
 // + server-driven post-game return countdown
+// + duplicate-name auto-suffix + same-device reclaim + optional lobby cap
 // Last updated: 2025-08-11
 
 const express = require('express');
@@ -12,10 +13,15 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*' },
-  // Help iOS when app backgrounds
+  // Helps iOS when the app backgrounds
   pingTimeout: 70000,
   pingInterval: 25000,
 });
+
+// ===== Config =====
+const DISCONNECT_GRACE_MS = 30000;        // 30s grace before deciding a DC = loss for the DC'd player
+const RETURN_TO_LOBBY_SECONDS = 10;       // server-driven countdown duration after game ends
+const MAX_LOBBY = parseInt(process.env.MAX_LOBBY || '200', 10); // optional cap
 
 // ===== Data stores =====
 // players[name] = {
@@ -30,8 +36,21 @@ const players = {};
 const chatHistory = []; // last 200 messages
 const MAX_CHAT = 200;
 
-const DISCONNECT_GRACE_MS = 30000; // 30s grace before awarding win on disconnect
-const RETURN_TO_LOBBY_SECONDS = 10; // server-driven countdown duration
+// ===== Helpers =====
+function normalizeBaseName(name) {
+  const trimmed = String(name || '').trim();
+  const m = trimmed.match(/^(.+?)\s*\((\d+)\)\s*$/);
+  return m ? m[1] : trimmed;
+}
+function getUniqueName(base, playersMap) {
+  const root = normalizeBaseName(base);
+  if (!playersMap[root]) return root;
+  for (let i = 2; i < 1000; i++) {
+    const candidate = `${root} (${i})`;
+    if (!playersMap[candidate]) return candidate;
+  }
+  return `${root} (${Date.now() % 10000})`;
+}
 
 function pushChat(name, message) {
   chatHistory.push({ name, message, ts: Date.now() });
@@ -95,6 +114,7 @@ function tryBeginTurns(name) {
   const opp = opponentOf(name);
   if (!me || !opp) return;
   if (me.secret && opp.secret) {
+    // Challenged goes first
     const first = me.role === 'challenged' ? me : (opp.role === 'challenged' ? opp : me);
     const second = first.name === me.name ? opp : me;
     first.currentTurn = true;
@@ -130,12 +150,11 @@ function endMatch(name, reason) {
       reason === 'lose' ? 'win' :
       reason === 'forfeit_win' ? 'forfeit_lose' :
       reason === 'forfeit_lose' ? 'forfeit_win' :
-      // 'opponent_disconnected' from name's POV → opponent sees win
-      'win';
+      'win'; // opponent_disconnected → opponent sees win
     io.to(opp.socketId).emit('gameOver', oppReason);
   }
 
-  // NEW: tell both sides when to return to lobby (visible countdown on client)
+  // Tell both sides when to return to lobby (visible countdown on client)
   if (me.socketId) io.to(me.socketId).emit('returnToLobbyIn', RETURN_TO_LOBBY_SECONDS);
   if (opp && opp.socketId) io.to(opp.socketId).emit('returnToLobbyIn', RETURN_TO_LOBBY_SECONDS);
 
@@ -155,227 +174,80 @@ function endMatch(name, reason) {
 
 // ===== Socket handlers =====
 io.on('connection', (socket) => {
-  // Registration
-  socket.on('registerName', (name, deviceId) => {
-    if (!name || typeof name !== 'string') return;
-    name = name.trim();
 
-    const existing = players[name];
-    const hadPlayer = !!existing;
+  // ---- Register Name (auto-suffix, same-device reclaim, lobby cap) ----
+  socket.on('registerName', (requestedName, deviceId) => {
+    if (!requestedName || typeof requestedName !== 'string') return;
+    let base = normalizeBaseName(requestedName);
 
-    if (existing) {
-      // Hand-over if same user on different socket/device
-      if (deviceId && existing.deviceId && deviceId !== existing.deviceId) {
-        if (existing.socketId) io.to(existing.socketId).emit('forceDisconnect');
-      }
-      players[name] = {
-        ...existing,
-        name,
-        socketId: socket.id,
-        deviceId: deviceId || existing.deviceId || null,
-        disconnectTs: null,
-      };
-    } else {
-      players[name] = {
-        name,
-        socketId: socket.id,
-        deviceId: deviceId || null,
-        inGame: false,
-        opponentName: null,
-        secret: null,
-        currentTurn: false,
-        role: null,
-        disconnectTs: null,
-        disconnectTimer: null,
-      };
+    const totalPlayers = Object.keys(players).length;
+    const existingBase = players[base];
+    const isSameDeviceReclaim = existingBase && existingBase.deviceId && deviceId && existingBase.deviceId === deviceId;
+
+    // LOBBY CAP: allow same-device reclaim even if at cap; otherwise block new entries
+    if (totalPlayers >= MAX_LOBBY && !isSameDeviceReclaim && !existingBase) {
+      socket.emit('lobbyFull', { max: MAX_LOBBY });
+      return;
     }
 
-    socket.data.playerName = name;
+    let assignedName;
 
-    socket.emit('nameRegistered');
+    if (existingBase) {
+      if (isSameDeviceReclaim) {
+        // Bump the old socket if needed, reclaim base
+        if (existingBase.socketId && existingBase.socketId !== socket.id) {
+          io.to(existingBase.socketId).emit('forceDisconnect');
+        }
+        assignedName = base;
+      } else {
+        // Someone else has this base → assign suffix
+        assignedName = getUniqueName(base, players);
+      }
+    } else {
+      // Base free
+      assignedName = base;
+    }
+
+    // Clean possible previous identity for this socket
+    const previousName = socket.data.playerName;
+    if (previousName && previousName !== assignedName && players[previousName] && players[previousName].socketId === socket.id) {
+      delete players[previousName];
+    }
+
+    // Upsert player
+    const prior = players[assignedName];
+    players[assignedName] = {
+      ...(prior || {}),
+      name: assignedName,
+      socketId: socket.id,
+      deviceId: deviceId || prior?.deviceId || null,
+      inGame: prior?.inGame || false,
+      opponentName: prior?.opponentName || null,
+      secret: prior?.secret || null,
+      currentTurn: prior?.currentTurn || false,
+      role: prior?.role || null,
+      disconnectTs: null,
+      disconnectTimer: prior?.disconnectTimer || null,
+    };
+
+    socket.data.playerName = assignedName;
+
+    // Tell the client their final/assigned name
+    socket.emit('nameRegistered', { assignedName });
+
+    // Optional notice if we changed their requested name
+    if (assignedName !== requestedName) {
+      io.to(socket.id).emit('chatMessage', { name: 'SYSTEM', message: `Your name is now “${assignedName}” (duplicate avoided).` });
+    }
+
+    // First time connect message
+    if (!prior) pushChat('SYSTEM', `${assignedName} connected`);
+
+    // Chat history / lobby snapshot
     socket.emit('chatHistory', chatHistory);
     broadcastLobby();
 
-    if (!hadPlayer) pushChat('SYSTEM', `${name} connected`);
-
-    // If player was mid-game, send them to match and sync
-    const me = players[name];
+    // If player was mid-game (same-device reclaim), put them back
+    const me = players[assignedName];
     if (me && me.inGame) {
-      socket.emit('redirectToMatch');
-      emitState(socket.id, name);
-    }
-  });
-
-  // Lobby: challenge flow
-  socket.on('challengePlayer', ({ challengerName, opponentName }) => {
-    const challenger = players[challengerName];
-    const opponent = players[opponentName];
-    if (!challenger || !opponent) return;
-    if (challenger.inGame || opponent.inGame) return;
-
-    pushChat('SYSTEM', `${challengerName} challenged ${opponentName}`);
-    if (opponent.socketId) io.to(opponent.socketId).emit('incomingChallenge', { from: challengerName });
-  });
-
-  socket.on('declineChallenge', ({ opponentName, challengerName }) => {
-    const ch = players[challengerName];
-    pushChat('SYSTEM', `${opponentName} declined a challenge from ${challengerName}`);
-    if (ch && ch.socketId) io.to(ch.socketId).emit('challengeDeclined', { by: opponentName });
-  });
-
-  socket.on('acceptChallenge', ({ challengerName, opponentName }) => {
-    const challenger = players[challengerName];
-    const opponent = players[opponentName];
-    if (!challenger || !opponent) return;
-
-    challenger.inGame = true;
-    opponent.inGame = true;
-    challenger.opponentName = opponentName;
-    opponent.opponentName = challengerName;
-
-    pushChat('SYSTEM', `${opponentName} accepted ${challengerName}'s challenge`);
-    pushChat('SYSTEM', `Match started: ${challengerName} vs ${opponentName}`);
-
-    startGameForPair(challengerName, opponentName);
-
-    if (challenger.socketId) io.to(challenger.socketId).emit('redirectToMatch');
-    if (opponent.socketId) io.to(opponent.socketId).emit('redirectToMatch');
-
-    broadcastLobby();
-  });
-
-  // Secret lock-in
-  socket.on('lockSecret', (secret) => {
-    const name = socket.data.playerName;
-    const me = players[name];
-    if (!me) return;
-
-    const opp = opponentOf(name);
-    if (!opp) {
-      // Opponent vanished before game start
-      if (me.socketId) {
-        io.to(me.socketId).emit('gameCanceled');
-        io.to(me.socketId).emit('returnToLobbyIn', RETURN_TO_LOBBY_SECONDS); // NEW: countdown
-      }
-      resetPlayerState(name);
-      broadcastLobby();
-      return;
-    }
-
-    // Validate secret: 4 unique digits
-    if (!/^\d{4}$/.test(secret) || new Set(secret.split('')).size !== 4) return;
-
-    me.secret = secret;
-    pushChat('SYSTEM', `${name} locked their secret`);
-    if (opp.socketId) io.to(opp.socketId).emit('opponentLocked');
-
-    tryBeginTurns(name);
-  });
-
-  // Turn submission
-  socket.on('submitGuess', (guess) => {
-    const name = socket.data.playerName;
-    const me = players[name];
-    const opp = opponentOf(name);
-    if (!me || !opp) return;
-    if (!me.currentTurn) return; // not your turn
-
-    if (!/^\d{4}$/.test(guess) || new Set(guess.split('')).size !== 4) return;
-
-    const { bulls, cows } = bullsAndCows(guess, opp.secret);
-
-    if (me.socketId) io.to(me.socketId).emit('guessResult', { guess, bulls, cows });
-    if (opp.socketId) io.to(opp.socketId).emit('opponentGuess', { guess, bulls, cows });
-
-    if (bulls === 4) {
-      endMatch(name, 'win');
-      return;
-    }
-
-    me.currentTurn = false;
-    opp.currentTurn = true;
-
-    if (opp.socketId) io.to(opp.socketId).emit('startGame', true);
-    if (me.socketId) io.to(me.socketId).emit('startGame', false);
-
-    emitState(me.socketId, me.name);
-    emitState(opp.socketId, opp.name);
-  });
-
-  // Timer expiry (turn)
-  socket.on('timerExpired', () => {
-    const name = socket.data.playerName;
-    const me = players[name];
-    if (!me) return;
-    const opp = opponentOf(name);
-    if (!opp) return;
-
-    if (me.currentTurn) {
-      pushChat('SYSTEM', `${name} forfeited on time`);
-      endMatch(name, 'forfeit_lose');
-    }
-  });
-
-  // Timer expiry (lock-in phase)
-  socket.on('lockTimerExpired', () => {
-    const name = socket.data.playerName;
-    const me = players[name];
-    if (!me) return;
-    const opp = opponentOf(name);
-    if (!opp) return;
-
-    if (!me.secret && me.inGame) {
-      pushChat('SYSTEM', `${name} failed to lock in on time`);
-      endMatch(name, 'forfeit_lose');
-    }
-  });
-
-  // State sync on demand
-  socket.on('requestState', () => {
-    const name = socket.data.playerName;
-    if (name && players[name]) emitState(socket.id, name);
-  });
-
-  // Lobby chat
-  socket.on('chatMessage', ({ name, message }) => {
-    if (!message || typeof message !== 'string') return;
-    pushChat(name || 'anon', message.trim());
-  });
-
-  // Disconnect with grace
-  socket.on('disconnect', () => {
-    const name = socket.data.playerName;
-    const me = players[name];
-    if (!name || !me) return;
-
-    me.disconnectTs = Date.now();
-    pushChat('SYSTEM', `${name} disconnected`);
-
-    if (!me.inGame) {
-      delete players[name];
-      broadcastLobby();
-      return;
-    }
-
-    if (me.disconnectTimer) clearTimeout(me.disconnectTimer);
-    me.disconnectTimer = setTimeout(() => {
-      const still = players[name];
-      if (!still) return;
-      const reconnected = still.socketId && still.disconnectTs === null;
-      if (!reconnected) {
-        // From their POV, opponent disconnected → they win
-        endMatch(name, 'opponent_disconnected');
-        const opp = opponentOf(name);
-        if (opp) resetPlayerState(opp.name);
-        resetPlayerState(name);
-        broadcastLobby();
-      }
-    }, DISCONNECT_GRACE_MS);
-  });
-});
-
-server.listen(process.env.PORT || 10000, () => {
-  console.log('Server running on port', process.env.PORT || 10000);
-});
-
-
+      socket.emit('redi
