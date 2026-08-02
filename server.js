@@ -40,6 +40,8 @@ const IDLE_TIMEOUT_MS        = 300000; // remove lobby players idle for 5+ minut
 //   turnTimer: Timeout|null,
 //   lockTimer: Timeout|null,
 //   lastSeen: number,
+//   turnStartedAt: number|null,  // ms timestamp when current turn began
+//   lockStartedAt: number|null,  // ms timestamp when lock-in phase began
 // }
 const players     = {};
 const chatHistory = [];
@@ -99,11 +101,13 @@ function resetPlayerState(name) {
   const p = players[name];
   if (!p) return;
   clearPlayerTimers(p);
-  p.inGame       = false;
-  p.opponentName = null;
-  p.secret       = null;
-  p.currentTurn  = false;
-  p.role         = null;
+  p.inGame         = false;
+  p.opponentName   = null;
+  p.secret         = null;
+  p.currentTurn    = false;
+  p.role           = null;
+  p.turnStartedAt  = null;
+  p.lockStartedAt  = null;
 }
 
 function removePlayer(name) {
@@ -123,6 +127,9 @@ function emitState(toSocketId, whoName) {
     yourTurn:       !!me.currentTurn,
     youLocked:      !!me.secret,
     opponentLocked: !!(opp && opp.secret),
+    turnStartedAt:  me.turnStartedAt || null,
+    lockStartedAt:  me.lockStartedAt || null,
+    turnLimitMs:    180000,
   });
 }
 
@@ -175,8 +182,11 @@ function tryBeginTurns(name) {
   first.currentTurn  = true;
   second.currentTurn = false;
 
-  if (first.socketId)  io.to(first.socketId).emit('gameStarted',  true);
-  if (second.socketId) io.to(second.socketId).emit('gameStarted', false);
+  const turnNow = Date.now();
+  first.turnStartedAt  = turnNow;
+  second.turnStartedAt = turnNow;
+  if (first.socketId)  io.to(first.socketId).emit('gameStarted',  { isMyTurn: true,  turnStartedAt: turnNow, turnLimitMs: 180000 });
+  if (second.socketId) io.to(second.socketId).emit('gameStarted', { isMyTurn: false, turnStartedAt: turnNow, turnLimitMs: 180000 });
 
   emitState(first.socketId,  first.name);
   emitState(second.socketId, second.name);
@@ -382,7 +392,10 @@ io.on('connection', (socket) => {
 
     broadcastLobby();
 
-    // Start lock-in timers for both players
+    // Stamp lock-in start time and begin server timers
+    const lockNow = Date.now();
+    if (players[challengerName]) players[challengerName].lockStartedAt = lockNow;
+    if (players[opponentName])   players[opponentName].lockStartedAt   = lockNow;
     startLockTimer(challengerName);
     startLockTimer(opponentName);
   });
@@ -442,8 +455,11 @@ io.on('connection', (socket) => {
     me.currentTurn  = false;
     opp.currentTurn = true;
 
-    if (opp.socketId) io.to(opp.socketId).emit('turnChanged', true);
-    if (me.socketId)  io.to(me.socketId).emit('turnChanged',  false);
+    const now = Date.now();
+    opp.turnStartedAt = now;
+    me.turnStartedAt  = now;
+    if (opp.socketId) io.to(opp.socketId).emit('turnChanged', { isMyTurn: true,  turnStartedAt: now, turnLimitMs: 180000 });
+    if (me.socketId)  io.to(me.socketId).emit('turnChanged',  { isMyTurn: false, turnStartedAt: now, turnLimitMs: 180000 });
 
     emitState(me.socketId,  me.name);
     emitState(opp.socketId, opp.name);
