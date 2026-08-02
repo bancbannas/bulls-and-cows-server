@@ -204,7 +204,7 @@ function endMatch(name, reason) {
   clearPlayerTimers(me);
   if (opp) clearPlayerTimers(opp);
 
-  // Notify both sides
+  // Notify both sides with result and each other's secret
   const oppReason =
     reason === 'win'                   ? 'lose' :
     reason === 'lose'                  ? 'win'  :
@@ -212,8 +212,12 @@ function endMatch(name, reason) {
     reason === 'forfeit_lose'          ? 'forfeit_win' :
     'win'; // opponent_disconnected
 
-  if (me.socketId)         io.to(me.socketId).emit('gameOver', reason);
-  if (opp && opp.socketId) io.to(opp.socketId).emit('gameOver', oppReason);
+  // Each player receives their opponent's secret for the post-game reveal
+  const meSecret  = me.secret  || null;
+  const oppSecret = opp ? opp.secret : null;
+
+  if (me.socketId)         io.to(me.socketId).emit('gameOver',  { result: reason,    opponentSecret: oppSecret });
+  if (opp && opp.socketId) io.to(opp.socketId).emit('gameOver', { result: oppReason, opponentSecret: meSecret  });
 
   // Countdown back to lobby
   if (me.socketId)         io.to(me.socketId).emit('returnToLobbyIn', RETURN_TO_LOBBY_SECONDS);
